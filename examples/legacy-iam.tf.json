@@ -1,0 +1,18 @@
+{
+  "resource": {
+    "aws_iam_role": {
+      "reader_role": {
+        "name": "reader",
+        "path": "/billing/",
+        "assume_role_policy": "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Principal\": {\"Federated\": \"arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/Example\"}, \"Action\": \"sts:AssumeRoleWithWebIdentity\"}]}"
+      }
+    },
+    "aws_iam_role_policy": {
+      "reader_role": {
+        "name": "aegismesh",
+        "role": "${aws_iam_role.reader_role.name}",
+        "policy": "{\"Version\": \"2012-10-17\", \"Statement\": [{\"Effect\": \"Allow\", \"Action\": \"s3:*\", \"Resource\": \"*\"}]}"
+      }
+    }
+  }
+}

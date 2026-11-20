@@ -1,8 +1,36 @@
 name: CI
+
 on: [push, pull_request]
+
+permissions:
+  contents: read
+
 jobs:
-  build:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo 'CI workflow ready to be populated'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: open-policy-agent/setup-opa@v2
+        with:
+          version: v1.4.2
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: '1.12.2'
+          terraform_wrapper: false
+      - run: go test -race -v ./...
+      - run: go vet ./...
+      - run: python -m pip install jsonschema==4.23.0 PyYAML==6.0.2
+      - name: Compile and validate example
+        run: |
+          go run ./cmd/aegismesh compile -intent examples/multitenant.json -previous-tf examples/legacy-iam.tf.json -out "${RUNNER_TEMP}/aegismesh"
+          python tests/validate_artifacts.py "${RUNNER_TEMP}/aegismesh"
+          go run ./cmd/aegismesh drift -intent examples/multitenant.json -live "${RUNNER_TEMP}/aegismesh/verified-live.json"
+          terraform -chdir="${RUNNER_TEMP}/aegismesh" init -backend=false -input=false
+          terraform -chdir="${RUNNER_TEMP}/aegismesh" validate
+      - run: go run ./benchmarks/run_bench.go

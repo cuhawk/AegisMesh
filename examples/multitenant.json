@@ -1,0 +1,137 @@
+{
+  "trustDomain": "cluster.local",
+  "spireParent": "spiffe://cluster.local/spire/agent/production",
+  "workloads": [
+    {
+      "id": "agent",
+      "namespace": "research",
+      "serviceAccount": "agent",
+      "tenant": "research",
+      "svidTTL": 900,
+      "ingress": true,
+      "untrusted": true
+    },
+    {
+      "id": "catalog",
+      "namespace": "research",
+      "serviceAccount": "catalog",
+      "tenant": "research",
+      "svidTTL": 1800
+    },
+    {
+      "id": "reader",
+      "namespace": "billing",
+      "serviceAccount": "reader",
+      "tenant": "billing",
+      "svidTTL": 600
+    }
+  ],
+  "resources": [
+    {
+      "id": "catalog-api",
+      "kind": "fqdn",
+      "value": "api.example.com"
+    },
+    {
+      "id": "vault-api",
+      "kind": "fqdn",
+      "value": "secretsmanager.us-east-1.amazonaws.com"
+    },
+    {
+      "id": "sts-api",
+      "kind": "fqdn",
+      "value": "sts.us-east-1.amazonaws.com"
+    },
+    {
+      "id": "vault",
+      "kind": "vault",
+      "value": "arn:aws:secretsmanager:us-east-1:123456789012:secret:billing-caFE01"
+    },
+    {
+      "id": "reader-role",
+      "kind": "role",
+      "value": "arn:aws:iam::123456789012:role/billing/reader"
+    },
+    {
+      "id": "imds",
+      "kind": "metadata",
+      "value": "169.254.169.254"
+    },
+    {
+      "id": "internet",
+      "kind": "internet",
+      "value": "world"
+    },
+    {
+      "id": "records",
+      "kind": "object",
+      "value": "arn:aws:s3:::billing-records/exports/summary.json"
+    }
+  ],
+  "rules": [
+    {
+      "from": "agent",
+      "to": "catalog",
+      "kind": "http",
+      "port": 8080,
+      "method": "GET",
+      "path": "/catalog"
+    },
+    {
+      "from": "catalog",
+      "to": "catalog-api",
+      "kind": "dns",
+      "port": 443,
+      "approvedEgress": true
+    },
+    {
+      "from": "reader",
+      "to": "sts-api",
+      "kind": "dns",
+      "port": 443,
+      "approvedEgress": true
+    },
+    {
+      "from": "reader",
+      "to": "vault-api",
+      "kind": "dns",
+      "port": 443,
+      "approvedEgress": true
+    },
+    {
+      "from": "reader",
+      "to": "reader-role",
+      "kind": "assume",
+      "action": "sts:AssumeRoleWithWebIdentity",
+      "oidcProvider": "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/Example",
+      "audience": "sts.amazonaws.com",
+      "subject": "system:serviceaccount:billing:reader"
+    },
+    {
+      "from": "reader-role",
+      "to": "vault",
+      "kind": "read",
+      "action": "secretsmanager:GetSecretValue"
+    },
+    {
+      "from": "reader-role",
+      "to": "records",
+      "kind": "read",
+      "action": "s3:GetObject"
+    }
+  ],
+  "neverReach": [
+    {
+      "from": "agent",
+      "to": "vault"
+    },
+    {
+      "from": "agent",
+      "to": "imds"
+    },
+    {
+      "from": "reader",
+      "to": "internet"
+    }
+  ]
+}
