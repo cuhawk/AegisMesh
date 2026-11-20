@@ -8,6 +8,7 @@ import (
 )
 
 type Intent struct {
+	Federation      *Federation         `json:"federation,omitempty"`
 	SPIREParent     string              `json:"spireParent"`
 	TrustDomain     string              `json:"trustDomain"`
 	Workloads       []Workload          `json:"workloads"`
@@ -21,6 +22,8 @@ type Intent struct {
 }
 
 type Workload struct {
+	TrustDomain    string       `json:"trustDomain,omitempty"`
+	ExecAllowlist  []string     `json:"execAllowlist,omitempty"`
 	ID             string       `json:"id"`
 	Namespace      string       `json:"namespace"`
 	ServiceAccount string       `json:"serviceAccount"`

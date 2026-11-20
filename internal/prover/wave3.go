@@ -47,7 +47,7 @@ func checkIdentity(in intent.Intent, add func(string, ...string)) map[string]boo
 			}
 		}
 		if c := w.Claims; c != nil {
-			delegatorPath, sameDomain := strings.CutPrefix(c.DelegatorSub, "spiffe://"+in.TrustDomain)
+			delegatorPath, sameDomain := strings.CutPrefix(c.DelegatorSub, "spiffe://"+w.Domain(in.TrustDomain))
 			if in.JWTAuthority == nil || !modelID.MatchString(c.ModelID) || !sameDomain ||
 				!canonicalPath(delegatorPath) || delegatorPath == "/" || c.DelegatorSub == w.SPIFFEID(in.TrustDomain) {
 				add("invalid model identity claims", w.ID, c.ModelID, c.DelegatorSub)
@@ -89,7 +89,7 @@ func checkGateway(in intent.Intent, workloads map[string]intent.Workload, allowe
 	}
 	names = make(map[string]bool)
 	matches := make(map[[5]string]string)
-	services := make(map[string]string)
+	services := make(map[[2]string]string)
 	used := make(map[grantKey]bool)
 	for _, r := range in.HTTPRoutes {
 		gateway, backend := workloads[r.Gateway], workloads[r.Backend]
@@ -97,25 +97,27 @@ func checkGateway(in intent.Intent, workloads map[string]intent.Workload, allowe
 		if !label.MatchString(r.Name) || !label.MatchString(r.Namespace) || !label.MatchString(r.Listener) ||
 			!domain(r.Hostname) || !label.MatchString(r.Service) || gateway.ID == "" ||
 			backend.ID == "" || gateway.ID == backend.ID || !gateway.Ingress ||
-			gateway.Tenant != backend.Tenant || backend.ToolScope != "" ||
+			in.Cluster(gateway) != in.Cluster(backend) || gateway.Tenant != backend.Tenant || backend.ToolScope != "" ||
 			!allowed[gatewayMatch{r.Gateway, r.Backend, r.Method, r.Path, r.Port}] {
 			add("HTTPRoute lacks a verified gateway backend edge", name, r.Gateway, r.Backend)
 			continue
 		}
-		if names[name] {
+		routeID := in.Cluster(gateway) + "/" + name
+		if names[routeID] {
 			add("duplicate HTTPRoute", name)
 		}
-		names[name] = true
+		names[routeID] = true
 		match := [5]string{r.Gateway, r.Listener, r.Hostname, r.Method, r.Path}
 		if other := matches[match]; other != "" {
 			add("conflicting HTTPRoute match", other, name)
 		}
 		matches[match] = name
 		service := backend.Namespace + "/" + r.Service
-		if other := services[service]; other != "" && other != backend.ID {
+		serviceID := [2]string{in.Cluster(backend), service}
+		if other := services[serviceID]; other != "" && other != backend.ID {
 			add("conflicting HTTPRoute backend identity", service, other, backend.ID)
 		}
-		services[service] = backend.ID
+		services[serviceID] = backend.ID
 		if r.Namespace != backend.Namespace {
 			key := grantKey{r.Namespace, backend.Namespace, r.Service}
 			if grants[key].Name == "" {
@@ -232,12 +234,12 @@ func checkIsolation(inventory *intent.IsolationInventory, workloads map[string]i
 }
 
 // Workloads outside the reverse tool graph need no tool-specific traversal.
-func toolAncestors(tools map[string]bool, predecessors map[string][]string) map[string]bool {
+func ancestors(targets map[string]bool, predecessors map[string][]string) map[string]bool {
 	seen := make(map[string]bool)
 	var queue []string
-	for tool := range tools {
-		seen[tool] = true
-		queue = append(queue, tool)
+	for target := range targets {
+		seen[target] = true
+		queue = append(queue, target)
 	}
 	for head := 0; head < len(queue); head++ {
 		for _, previous := range predecessors[queue[head]] {

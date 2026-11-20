@@ -59,7 +59,7 @@ type IPBlock struct {
 }
 
 func (w Workload) Principal(trustDomain string) string {
-	return trustDomain + "/ns/" + w.Namespace + "/sa/" + w.ServiceAccount
+	return w.Domain(trustDomain) + "/ns/" + w.Namespace + "/sa/" + w.ServiceAccount
 }
 
 func (w Workload) SPIFFEID(trustDomain string) string {

@@ -3,6 +3,7 @@ package prover
 
 import (
 	"fmt"
+	"maps"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -95,9 +96,7 @@ func Check(in intent.Intent) []Finding {
 	if !domain(in.TrustDomain) || len(in.Workloads) == 0 {
 		add("invalid trust domain or empty workloads", in.TrustDomain)
 	}
-	parentPath, ok := strings.CutPrefix(in.SPIREParent, "spiffe://"+in.TrustDomain)
-	if !ok || !strings.HasPrefix(parentPath, "/spire/agent/") || !path.MatchString(parentPath) ||
-		slices.Contains(strings.Split(parentPath, "/"), "..") || slices.Contains(strings.Split(parentPath, "/"), ".") {
+	if !validParent(in.TrustDomain, in.SPIREParent) {
 		add("invalid SPIRE parent identity", in.SPIREParent)
 	}
 	kinds := make(map[string]string)
@@ -110,13 +109,15 @@ func Check(in intent.Intent) []Finding {
 			!label.MatchString(w.ServiceAccount) || w.SVIDTTL < 1 || w.SVIDTTL > 3600 || kinds[w.ID] != "" {
 			add("invalid or duplicate workload", w.ID)
 		}
-		identity := w.Namespace + "/" + w.ServiceAccount
+		checkWorkloadPolicy(in, w, add)
+		identity := w.Principal(in.TrustDomain)
 		if old, exists := identities[identity]; exists {
 			add("shared workload identity", old, w.ID)
 		}
 		identities[identity] = w.ID
 		kinds[w.ID], workloads[w.ID] = "workload", w
 	}
+	federatedReach := checkFederation(in, workloads, add)
 	tools := checkIdentity(in, add)
 	checkIsolation(in.Isolation, workloads, add)
 	for _, resource := range in.Resources {
@@ -177,6 +178,17 @@ func Check(in intent.Intent) []Finding {
 			add("unexpected tool scope on edge", r.From, r.To)
 			continue
 		}
+		if in.Federation != nil && !r.Deny && to == "workload" {
+			sourceDomain, targetDomain := fromWorkload.Domain(in.TrustDomain), toWorkload.Domain(in.TrustDomain)
+			domains := in.Federation.TrustDomains
+			if fromWorkload.ID == "" {
+				add("federated workload edge lacks a workload identity", r.From, r.To)
+			} else if sourceDomain != targetDomain && (r.Kind != "http" ||
+				!slices.Contains(domains[sourceDomain].Trusts, targetDomain) ||
+				!slices.Contains(domains[targetDomain].Trusts, sourceDomain)) {
+				add("cross-domain edge requires HTTP and mutual bundle trust", r.From, sourceDomain, targetDomain, r.To)
+			}
+		}
 		if !r.Deny && r.Kind == "http" && workloads[r.From].Tenant != workloads[r.To].Tenant {
 			add("cross-tenant HTTP allow", r.From, r.To)
 		}
@@ -210,6 +222,7 @@ func Check(in intent.Intent) []Finding {
 	toolCalls := make(map[string][]intent.Rule)
 	allowedToolCalls := make(map[match]bool)
 	predecessors := make(map[string][]string)
+	reachabilityTargets := maps.Clone(tools)
 	gatewayEdges := make(map[gatewayMatch]bool)
 	for _, r := range in.Rules {
 		st := states[key(r)]
@@ -224,7 +237,13 @@ func Check(in intent.Intent) []Finding {
 			add("role grants access without managed trust", r.From, r.To)
 		}
 		graph[r.From] = append(graph[r.From], r.To)
-		if len(tools) != 0 {
+		if in.Federation != nil {
+			from, to := workloads[r.From], workloads[r.To]
+			if to.ID != "" && (from.ID == "" || from.Domain(in.TrustDomain) != to.Domain(in.TrustDomain)) {
+				reachabilityTargets[r.From] = true
+			}
+		}
+		if len(tools) != 0 || in.Federation != nil {
 			predecessors[r.To] = append(predecessors[r.To], r.From)
 		}
 		if r.Kind == "http" {
@@ -238,7 +257,7 @@ func Check(in intent.Intent) []Finding {
 		}
 	}
 	checkGateway(in, workloads, gatewayEdges, add)
-	canReachTools := toolAncestors(tools, predecessors)
+	requiresTraversal := ancestors(reachabilityTargets, predecessors)
 	for from := range graph {
 		slices.Sort(graph[from])
 	}
@@ -258,7 +277,7 @@ func Check(in intent.Intent) []Finding {
 	slices.Sort(sources)
 	for _, id := range sources {
 		w := workloads[id]
-		if !w.Ingress && !w.Untrusted && len(queries[id]) == 0 && (!canReachTools[id] || w.ID == "") {
+		if !w.Ingress && !w.Untrusted && len(queries[id]) == 0 && (!requiresTraversal[id] || w.ID == "") {
 			continue
 		}
 		previous := map[string]string{id: ""}
@@ -276,6 +295,11 @@ func Check(in intent.Intent) []Finding {
 			current := queue[head]
 			kind := kinds[current]
 			if current != id && w.ID != "" {
+				target := workloads[current]
+				if in.Federation != nil && target.ID != "" && w.Domain(in.TrustDomain) != target.Domain(in.TrustDomain) &&
+					!federatedReach[intent.Pair{From: id, To: current}] {
+					add("unauthorized cross-domain reachability", witness(current)...)
+				}
 				for _, call := range toolCalls[current] {
 					tool := call.To
 					call.From = id

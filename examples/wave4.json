@@ -1,0 +1,292 @@
+{
+  "trustDomain": "cluster.local",
+  "spireParent": "spiffe://cluster.local/spire/agent/production",
+  "workloads": [
+    {
+      "id": "agent",
+      "namespace": "research",
+      "serviceAccount": "agent",
+      "tenant": "research",
+      "svidTTL": 900,
+      "ingress": true,
+      "untrusted": true,
+      "svidClaims": {
+        "model_id": "catalog-model:v2",
+        "tool_scopes": [
+          "lookup"
+        ],
+        "delegator_sub": "spiffe://cluster.local/platform/delegator"
+      },
+      "execAllowlist": [
+        "/usr/local/bin/catalog-agent"
+      ]
+    },
+    {
+      "id": "catalog",
+      "namespace": "research",
+      "serviceAccount": "catalog",
+      "tenant": "research",
+      "svidTTL": 1800
+    },
+    {
+      "id": "reader",
+      "namespace": "billing",
+      "serviceAccount": "reader",
+      "tenant": "billing",
+      "svidTTL": 600
+    },
+    {
+      "id": "catalog-tool",
+      "namespace": "tools",
+      "serviceAccount": "catalog-tool",
+      "tenant": "research",
+      "svidTTL": 600,
+      "toolScope": "lookup",
+      "trustDomain": "west.example.org",
+      "execAllowlist": [
+        "/usr/local/bin/catalog-tool",
+        "/usr/bin/tini"
+      ]
+    },
+    {
+      "id": "edge",
+      "namespace": "edge",
+      "serviceAccount": "edge",
+      "tenant": "research",
+      "svidTTL": 600,
+      "ingress": true
+    },
+    {
+      "id": "mirror",
+      "namespace": "research",
+      "serviceAccount": "catalog",
+      "tenant": "research",
+      "svidTTL": 1800,
+      "trustDomain": "west.example.org"
+    }
+  ],
+  "resources": [
+    {
+      "id": "catalog-api",
+      "kind": "fqdn",
+      "value": "api.example.com"
+    },
+    {
+      "id": "vault-api",
+      "kind": "fqdn",
+      "value": "secretsmanager.us-east-1.amazonaws.com"
+    },
+    {
+      "id": "sts-api",
+      "kind": "fqdn",
+      "value": "sts.us-east-1.amazonaws.com"
+    },
+    {
+      "id": "vault",
+      "kind": "vault",
+      "value": "arn:aws:secretsmanager:us-east-1:123456789012:secret:billing-caFE01"
+    },
+    {
+      "id": "reader-role",
+      "kind": "role",
+      "value": "arn:aws:iam::123456789012:role/billing/reader"
+    },
+    {
+      "id": "imds",
+      "kind": "metadata",
+      "value": "169.254.169.254"
+    },
+    {
+      "id": "internet",
+      "kind": "internet",
+      "value": "world"
+    },
+    {
+      "id": "records",
+      "kind": "object",
+      "value": "arn:aws:s3:::billing-records/exports/summary.json"
+    }
+  ],
+  "rules": [
+    {
+      "from": "agent",
+      "to": "catalog",
+      "kind": "http",
+      "port": 8080,
+      "method": "GET",
+      "path": "/catalog"
+    },
+    {
+      "from": "catalog",
+      "to": "catalog-api",
+      "kind": "dns",
+      "port": 443,
+      "approvedEgress": true
+    },
+    {
+      "from": "reader",
+      "to": "sts-api",
+      "kind": "dns",
+      "port": 443,
+      "approvedEgress": true
+    },
+    {
+      "from": "reader",
+      "to": "vault-api",
+      "kind": "dns",
+      "port": 443,
+      "approvedEgress": true
+    },
+    {
+      "from": "reader",
+      "to": "reader-role",
+      "kind": "assume",
+      "action": "sts:AssumeRoleWithWebIdentity",
+      "oidcProvider": "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/Example",
+      "audience": "sts.amazonaws.com",
+      "subject": "system:serviceaccount:billing:reader"
+    },
+    {
+      "from": "reader-role",
+      "to": "vault",
+      "kind": "read",
+      "action": "secretsmanager:GetSecretValue"
+    },
+    {
+      "from": "reader-role",
+      "to": "records",
+      "kind": "read",
+      "action": "s3:GetObject"
+    },
+    {
+      "from": "agent",
+      "to": "catalog-tool",
+      "kind": "http",
+      "method": "POST",
+      "path": "/lookup",
+      "port": 8080,
+      "toolScope": "lookup"
+    },
+    {
+      "from": "edge",
+      "to": "catalog",
+      "kind": "http",
+      "method": "GET",
+      "path": "/catalog",
+      "port": 8080
+    },
+    {
+      "from": "catalog",
+      "to": "mirror",
+      "kind": "http",
+      "port": 8080,
+      "method": "GET",
+      "path": "/catalog"
+    }
+  ],
+  "neverReach": [
+    {
+      "from": "agent",
+      "to": "vault"
+    },
+    {
+      "from": "agent",
+      "to": "imds"
+    },
+    {
+      "from": "reader",
+      "to": "internet"
+    }
+  ],
+  "jwtAuthority": {
+    "issuer": "https://identity.example.com",
+    "jwksURI": "https://identity.example.com/jwks.json"
+  },
+  "httpRoutes": [
+    {
+      "name": "catalog",
+      "namespace": "edge",
+      "gateway": "edge",
+      "listener": "https",
+      "hostname": "catalog.example.com",
+      "backend": "catalog",
+      "service": "catalog",
+      "port": 8080,
+      "method": "GET",
+      "path": "/catalog"
+    }
+  ],
+  "referenceGrants": [
+    {
+      "name": "edge-to-catalog",
+      "namespace": "research",
+      "fromNamespace": "edge",
+      "service": "catalog"
+    }
+  ],
+  "isolation": {
+    "envoyAdmins": [
+      {
+        "workload": "edge",
+        "address": "127.0.0.1:15000",
+        "isolated": true
+      }
+    ],
+    "tlsSecretSyncs": [
+      {
+        "sourceNamespace": "edge",
+        "sourceName": "catalog-tls",
+        "targetNamespace": "cilium-secrets",
+        "targetName": "edge-catalog-tls"
+      }
+    ],
+    "clusterCIDRs": [
+      "10.42.0.0/16",
+      "fd42:42::/64"
+    ],
+    "ipBlocks": [
+      {
+        "policy": "edge/partner-egress",
+        "cidr": "198.51.100.0/24"
+      }
+    ]
+  },
+  "federation": {
+    "trustDomains": {
+      "cluster.local": {
+        "cluster": "east",
+        "spireParent": "spiffe://cluster.local/spire/agent/production",
+        "bundleEndpoint": "https://bundle.east.example.org:8443",
+        "trusts": [
+          "west.example.org"
+        ]
+      },
+      "west.example.org": {
+        "cluster": "west",
+        "spireParent": "spiffe://west.example.org/spire/agent/production",
+        "bundleEndpoint": "https://bundle.west.example.org:8443",
+        "trusts": [
+          "cluster.local"
+        ]
+      }
+    },
+    "allowReach": [
+      {
+        "from": "agent",
+        "to": "catalog-tool"
+      },
+      {
+        "from": "catalog",
+        "to": "mirror"
+      },
+      {
+        "from": "agent",
+        "to": "mirror"
+      },
+      {
+        "from": "edge",
+        "to": "mirror"
+      }
+    ]
+  }
+}
