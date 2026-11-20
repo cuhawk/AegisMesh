@@ -100,6 +100,11 @@ func TestHostileMutations(t *testing.T) {
 			in.Rules[2].ApprovedEgress = false
 			in.Rules[3].ApprovedEgress = false
 		}},
+		{"quarantined reader reaches approved FQDN through deputy", "Lethal Trifecta unauthorized egress", "reader -> catalog -> catalog-api", func(in *intent.Intent) {
+			in.Workloads[2].Untrusted = true
+			in.Rules = slices.Delete(in.Rules, 2, 4)
+			in.Rules = append(in.Rules, link("reader", "catalog", "proxy"))
+		}},
 		{"agent self-approves egress", "invalid or overly broad dns rule", "agent -> catalog-api", func(in *intent.Intent) {
 			in.Rules[1].From = "agent"
 		}},

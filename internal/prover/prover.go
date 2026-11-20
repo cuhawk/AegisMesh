@@ -86,11 +86,6 @@ func validateRule(r intent.Rule, from, to string, source intent.Workload, resour
 	return "invalid or overly broad " + r.Kind + " rule"
 }
 
-type edge struct {
-	to       string
-	approved bool
-}
-
 // Check audits rules, then proves invariants over a default-deny capability graph.
 func Check(in intent.Intent) []Finding {
 	var findings []Finding
@@ -198,7 +193,7 @@ func Check(in intent.Intent) []Finding {
 		account = roleAccount
 		assumedRoles[r.From], trustedRoles[r.To] = r.To, true
 	}
-	graph := make(map[string][]edge)
+	graph := make(map[string][]string)
 	for _, r := range in.Rules {
 		st := states[key(r)]
 		if r.Deny || !st.allow {
@@ -211,10 +206,10 @@ func Check(in intent.Intent) []Finding {
 		if r.Kind == "read" && !trustedRoles[r.From] {
 			add("role grants access without managed trust", r.From, r.To)
 		}
-		graph[r.From] = append(graph[r.From], edge{r.To, r.ApprovedEgress})
+		graph[r.From] = append(graph[r.From], r.To)
 	}
 	for from := range graph {
-		slices.SortFunc(graph[from], func(a, b edge) int { return strings.Compare(a.to, b.to) })
+		slices.Sort(graph[from])
 	}
 	// Index explicit queries by source so multiple properties share a traversal.
 	queries := make(map[string][]string)
@@ -256,13 +251,13 @@ func Check(in intent.Intent) []Finding {
 				add("metadata reachable", witness(current)...)
 			}
 			for _, next := range graph[current] {
-				kind := kinds[next.to]
-				if egress == "" && (kind == "internet" || kind == "cidr" || (kind == "fqdn" && !next.approved)) {
-					egress, egressVia = next.to, current
+				kind := kinds[next]
+				if egress == "" && (kind == "internet" || kind == "cidr" || kind == "fqdn") {
+					egress, egressVia = next, current
 				}
-				if _, seen := previous[next.to]; !seen {
-					previous[next.to] = current
-					queue = append(queue, next.to)
+				if _, seen := previous[next]; !seen {
+					previous[next] = current
+					queue = append(queue, next)
 				}
 			}
 		}

@@ -14,7 +14,7 @@ For each source with applicable queries, breadth-first search explores outgoing 
 
 1. Every declared `neverReach` destination is absent from its source's reachable set.
 2. Neither supported metadata IP nor a declared CIDR containing it is reachable from an ingress or untrusted workload.
-3. An untrusted workload cannot have both a path to a private secret or object and a path to unauthorized egress. Two shortest witnesses show the capabilities separately. Raw internet and external CIDRs are unauthorized. An exact FQDN edge may be declared an approved destination from a trusted workload. Approval applies to that edge. Downstream redirects and proxies remain in the graph.
+3. An untrusted workload cannot have both a path to a private secret or object and a path to unauthorized egress. Two shortest witnesses show the capabilities separately. Raw internet, external CIDRs, and exact external FQDNs are unauthorized in combination with private-data access. An approved DNS edge from a trusted deputy still counts as external egress for the untrusted caller. Downstream redirects and proxies remain in the graph.
 
 The validation pass rejects invalid resource and rule forms, broad or wildcard grants, ambiguous identities, shared role binding slots, and contradictory rules. With Q queried sources, V vertices and E edges, traversal takes O(Q(V+E)) time in the worst case. A traversal uses O(V) working memory after indexing the graph. Adjacency sorting and witness materialization add their own costs. Compile includes validation and graph proof before artifact generation. A finding prevents publication.
 
