@@ -218,3 +218,166 @@ matches_iam(name, suffix, body) if {
 	key := concat("", [replace(name, "_", "-"), suffix])
 	json.unmarshal(body) == input.iam[key]
 }
+
+# Runtime query. The caller supplies claims only after verifying the JWT-SVID
+# signature, lifetime and issuer, and gets the peer principal from mTLS.
+default allow_tool := false
+
+allow_tool if {
+	some edge in data.aegismesh_tool_authorizations
+	input.namespace == edge.namespace
+	input.tool == edge.tool
+	input.peer_principal == edge.principal
+	input.method == edge.method
+	input.path == edge.path
+	input.port == edge.port
+	input.claims.iss == edge.issuer
+	input.claims.sub == edge.subject
+	audience_matches(input.claims.aud, edge.audience)
+	input.claims.model_id == edge.model_id
+	is_array(input.claims.tool_scopes)
+	edge.tool_scope in input.claims.tool_scopes
+	input.claims.delegator_sub == edge.delegator_sub
+}
+
+audience_matches(aud, expected) if aud == expected
+
+audience_matches(aud, expected) if {
+	is_array(aud)
+	expected in aud
+}
+
+tool_rule(edge) := {
+	"from": [{"source": {"principals": [edge.principal]}}],
+	"to": [{"operation": {"methods": [edge.method], "paths": [edge.path], "ports": [edge.port]}}],
+	"when": [
+		{"key": "request.auth.claims[iss]", "values": [edge.issuer]},
+		{"key": "request.auth.claims[sub]", "values": [edge.subject]},
+		{"key": "request.auth.claims[aud]", "values": [edge.audience]},
+		{"key": "request.auth.claims[model_id]", "values": [edge.model_id]},
+		{"key": "request.auth.claims[tool_scopes]", "values": [edge.tool_scope]},
+		{"key": "request.auth.claims[delegator_sub]", "values": [edge.delegator_sub]},
+	],
+}
+
+tool_selector(tool) := {"matchLabels": {"aegismesh.io/workload": tool}}
+
+tool_authentication_matches(policy, edge) if {
+	policy.kind == "RequestAuthentication"
+	policy.metadata.namespace == edge.namespace
+	policy.metadata.name == edge.tool
+	policy.spec == {
+		"selector": tool_selector(edge.tool),
+		"jwtRules": [{"issuer": edge.issuer, "jwksUri": edge.jwksURI, "audiences": [edge.audience]}],
+	}
+}
+
+valid_tool_authorization(edge) if {
+	some policy in input.kubernetes
+	policy.kind == "AuthorizationPolicy"
+	policy.metadata.namespace == edge.namespace
+	policy.metadata.name == edge.tool
+	policy.spec.selector == tool_selector(edge.tool)
+	policy.spec.action == "ALLOW"
+	expected := {tool_rule(other) |
+		some other in input.toolAuthorizations
+		other.namespace == edge.namespace
+		other.tool == edge.tool
+	}
+	{rule | some rule in policy.spec.rules} == expected
+	some authentication in input.kubernetes
+	tool_authentication_matches(authentication, edge)
+}
+
+deny contains msg if {
+	some edge in input.toolAuthorizations
+	not valid_tool_authorization(edge)
+	msg := sprintf("tool authorization drift: %s/%s", [edge.namespace, edge.tool])
+}
+
+deny contains msg if {
+	some policy in input.kubernetes
+	policy.kind == "RequestAuthentication"
+	some authorization in input.kubernetes
+	authorization.kind == "AuthorizationPolicy"
+	authorization.metadata == policy.metadata
+	some rule in authorization.spec.rules
+	not tool_rule_declared(policy, rule)
+	msg := sprintf("undeclared tool authorization: %s/%s", [policy.metadata.namespace, policy.metadata.name])
+}
+
+tool_rule_declared(authentication, rule) if {
+	some edge in input.toolAuthorizations
+	tool_authentication_matches(authentication, edge)
+	tool_rule(edge) == rule
+}
+
+deny contains msg if {
+	some profile in [input.kubernetes, input.ciliumHTTP]
+	some route in profile
+	route.kind == "HTTPRoute"
+	some rule in route.spec.rules
+	some backend in rule.backendRefs
+	namespace := object.get(backend, "namespace", route.metadata.namespace)
+	namespace != route.metadata.namespace
+	not reference_granted(profile, route.metadata.namespace, namespace, backend)
+	msg := sprintf("missing route grant: %s/%s -> %s/%s", [route.metadata.namespace, route.metadata.name, namespace, backend.name])
+}
+
+reference_granted(profile, from, to, backend) if {
+	object.get(backend, "group", "") == ""
+	object.get(backend, "kind", "Service") == "Service"
+	some grant in profile
+	grant.kind == "ReferenceGrant"
+	grant.metadata.namespace == to
+	grant.spec.from == [{"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": from}]
+	grant.spec.to == [{"group": "", "kind": "Service", "name": backend.name}]
+}
+
+deny contains msg if {
+	some grant in policies
+	grant.kind == "ReferenceGrant"
+	not scoped_reference_grant(grant)
+	msg := sprintf("unscoped ReferenceGrant: %s/%s", [grant.metadata.namespace, grant.metadata.name])
+}
+
+scoped_reference_grant(grant) if {
+	[from] := grant.spec.from
+	[to] := grant.spec.to
+	from == {"group": "gateway.networking.k8s.io", "kind": "HTTPRoute", "namespace": from.namespace}
+	to == {"group": "", "kind": "Service", "name": to.name}
+	from.namespace != grant.metadata.namespace
+	regex.match("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", from.namespace)
+	regex.match("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", to.name)
+}
+
+deny contains msg if {
+	some route in policies
+	route.kind == "HTTPRoute"
+	not scoped_route(route.spec)
+	msg := sprintf("unscoped HTTPRoute: %s/%s", [route.metadata.namespace, route.metadata.name])
+}
+
+scoped_route(spec) if {
+	[parent] := spec.parentRefs
+	parent.name != ""
+	parent.sectionName != ""
+	object.get(parent, "group", "gateway.networking.k8s.io") == "gateway.networking.k8s.io"
+	object.get(parent, "kind", "Gateway") == "Gateway"
+	[hostname] := spec.hostnames
+	regex.match("^[a-z0-9-]+(\\.[a-z0-9-]+)+$", hostname)
+	[rule] := spec.rules
+	[match] := rule.matches
+	match.method in {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
+	match.path.type == "Exact"
+	regex.match("^(/[A-Za-z0-9._~-]+)*/?$", match.path.value)
+	[backend] := rule.backendRefs
+	object.get(backend, "group", "") == ""
+	object.get(backend, "kind", "Service") == "Service"
+	regex.match("^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$", backend.name)
+	is_number(backend.port)
+	backend.port >= 1
+	backend.port <= 65535
+	object.get(rule, "filters", []) == []
+	object.get(backend, "filters", []) == []
+}

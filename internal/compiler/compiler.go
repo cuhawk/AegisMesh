@@ -19,11 +19,12 @@ import (
 type object = map[string]any
 
 type Bundle struct {
-	CiliumHTTP []object                    `json:"ciliumHTTP"`
-	Kubernetes []object                    `json:"kubernetes"`
-	SPIRE      []object                    `json:"spire"`
-	Terraform  object                      `json:"terraform"`
-	IAM        map[string]terraform.Policy `json:"iam"`
+	CiliumHTTP         []object                    `json:"ciliumHTTP"`
+	Kubernetes         []object                    `json:"kubernetes"`
+	SPIRE              []object                    `json:"spire"`
+	Terraform          object                      `json:"terraform"`
+	IAM                map[string]terraform.Policy `json:"iam"`
+	ToolAuthorizations []ToolAuthorization         `json:"toolAuthorizations,omitempty"`
 }
 
 func manifest(api, kind, name, namespace string, spec object) object {
@@ -48,10 +49,6 @@ func port(p int, protocol string, rules object) []object {
 		result["rules"] = rules
 	}
 	return []object{result}
-}
-
-func principal(w intent.Workload, trustDomain string) string {
-	return trustDomain + "/ns/" + w.Namespace + "/sa/" + w.ServiceAccount
 }
 
 // Compile is deterministic for logically identical input orderings.
@@ -107,13 +104,21 @@ func Compile(in intent.Intent) (Bundle, error) {
 		case "http":
 			from, to := workloads[r.From], workloads[r.To]
 			http := object{"http": []object{{"method": "^" + r.Method + "$", "path": "^" + regexp.QuoteMeta(r.Path) + "$"}}}
-			httpIngress[r.To] = append(httpIngress[r.To], object{"fromEndpoints": []object{endpoint(from, true)}, "toPorts": port(r.Port, "TCP", http)})
+			if to.ToolScope == "" {
+				httpIngress[r.To] = append(httpIngress[r.To], object{"fromEndpoints": []object{endpoint(from, true)}, "toPorts": port(r.Port, "TCP", http)})
+			}
 			ingress[r.To] = append(ingress[r.To], object{"fromEndpoints": []object{endpoint(from, true)}, "toPorts": port(r.Port, "TCP", nil)})
 			egress[r.From] = append(egress[r.From], object{"toEndpoints": []object{endpoint(to, true)}, "toPorts": port(r.Port, "TCP", nil)})
-			authz[r.To] = append(authz[r.To], object{
-				"from": []object{{"source": object{"principals": []string{principal(from, in.TrustDomain)}}}},
+			rule := object{
+				"from": []object{{"source": object{"principals": []string{from.Principal(in.TrustDomain)}}}},
 				"to":   []object{{"operation": object{"methods": []string{r.Method}, "paths": []string{r.Path}, "ports": []string{strconv.Itoa(r.Port)}}}},
-			})
+			}
+			if to.ToolScope != "" {
+				a := toolAuthorization(in, from, to, r)
+				a.constrain(rule)
+				b.ToolAuthorizations = append(b.ToolAuthorizations, a)
+			}
+			authz[r.To] = append(authz[r.To], rule)
 		case "dns":
 			name := resources[r.To].Value
 			dns[r.From] = append(dns[r.From], object{"matchName": name})
@@ -143,12 +148,21 @@ func Compile(in intent.Intent) (Bundle, error) {
 			auth["rules"] = authz[w.ID]
 		}
 		b.Kubernetes = append(b.Kubernetes, manifest(istio, "AuthorizationPolicy", w.ID, w.Namespace, auth))
+		if w.ToolScope != "" {
+			b.Kubernetes = append(b.Kubernetes, manifest(istio, "RequestAuthentication", w.ID, w.Namespace, object{
+				"selector": selector,
+				"jwtRules": []object{{
+					"issuer": in.JWTAuthority.Issuer, "jwksUri": in.JWTAuthority.JWKSURI,
+					"audiences": []string{w.SPIFFEID(in.TrustDomain)},
+				}},
+			}))
+		}
 		if !namespaces[w.Namespace] {
 			namespaces[w.Namespace] = true
 			b.Kubernetes = append(b.Kubernetes, manifest(istio, "PeerAuthentication", "aegismesh-strict", w.Namespace, object{"mtls": object{"mode": "STRICT"}}))
 		}
 		b.SPIRE = append(b.SPIRE, object{
-			"spiffe_id":     "spiffe://" + principal(w, in.TrustDomain),
+			"spiffe_id":     w.SPIFFEID(in.TrustDomain),
 			"parent_id":     in.SPIREParent,
 			"x509_svid_ttl": w.SVIDTTL,
 			"selectors": []object{
@@ -166,6 +180,9 @@ func Compile(in intent.Intent) (Bundle, error) {
 			b.CiliumHTTP = append(b.CiliumHTTP, sa)
 		}
 	}
+	gateway := gatewayArtifacts(in, workloads)
+	b.Kubernetes = append(b.Kubernetes, gateway...)
+	b.CiliumHTTP = append(b.CiliumHTTP, gateway...)
 	return b, nil
 }
 

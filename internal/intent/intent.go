@@ -8,22 +8,28 @@ import (
 )
 
 type Intent struct {
-	SPIREParent string     `json:"spireParent"`
-	TrustDomain string     `json:"trustDomain"`
-	Workloads   []Workload `json:"workloads"`
-	Resources   []Resource `json:"resources"`
-	Rules       []Rule     `json:"rules"`
-	NeverReach  []Pair     `json:"neverReach"`
+	SPIREParent     string              `json:"spireParent"`
+	TrustDomain     string              `json:"trustDomain"`
+	Workloads       []Workload          `json:"workloads"`
+	Resources       []Resource          `json:"resources"`
+	Rules           []Rule              `json:"rules"`
+	NeverReach      []Pair              `json:"neverReach"`
+	JWTAuthority    *JWTAuthority       `json:"jwtAuthority,omitempty"`
+	HTTPRoutes      []HTTPRoute         `json:"httpRoutes,omitempty"`
+	ReferenceGrants []ReferenceGrant    `json:"referenceGrants,omitempty"`
+	Isolation       *IsolationInventory `json:"isolation,omitempty"`
 }
 
 type Workload struct {
-	ID             string `json:"id"`
-	Namespace      string `json:"namespace"`
-	ServiceAccount string `json:"serviceAccount"`
-	Tenant         string `json:"tenant"`
-	SVIDTTL        int    `json:"svidTTL"`
-	Ingress        bool   `json:"ingress,omitempty"`
-	Untrusted      bool   `json:"untrusted,omitempty"`
+	ID             string       `json:"id"`
+	Namespace      string       `json:"namespace"`
+	ServiceAccount string       `json:"serviceAccount"`
+	Tenant         string       `json:"tenant"`
+	SVIDTTL        int          `json:"svidTTL"`
+	Ingress        bool         `json:"ingress,omitempty"`
+	Untrusted      bool         `json:"untrusted,omitempty"`
+	Claims         *ModelClaims `json:"svidClaims,omitempty"`
+	ToolScope      string       `json:"toolScope,omitempty"`
 }
 
 type Resource struct {
@@ -49,6 +55,7 @@ type Rule struct {
 	Audience       string `json:"audience,omitempty"`
 	Subject        string `json:"subject,omitempty"`
 	ApprovedEgress bool   `json:"approvedEgress,omitempty"`
+	ToolScope      string `json:"toolScope,omitempty"`
 }
 
 func Decode(r io.Reader) (Intent, error) {

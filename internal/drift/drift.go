@@ -64,7 +64,7 @@ func managedFields(o object) ([]byte, error) {
 
 func relevant(o object) bool {
 	switch o["kind"] {
-	case "NetworkPolicy", "CiliumNetworkPolicy", "CiliumClusterwideNetworkPolicy", "AuthorizationPolicy", "PeerAuthentication":
+	case "NetworkPolicy", "CiliumNetworkPolicy", "CiliumClusterwideNetworkPolicy", "AuthorizationPolicy", "PeerAuthentication", "RequestAuthentication", "HTTPRoute", "ReferenceGrant":
 		return true
 	case "ServiceAccount":
 		m, _ := o["metadata"].(object)
