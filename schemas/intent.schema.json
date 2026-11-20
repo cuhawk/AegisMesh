@@ -42,6 +42,24 @@
       "items": {
         "$ref": "#/$defs/pair"
       }
+    },
+    "jwtAuthority": {
+      "$ref": "#/$defs/jwtAuthority"
+    },
+    "httpRoutes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/httpRoute"
+      }
+    },
+    "referenceGrants": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/referenceGrant"
+      }
+    },
+    "isolation": {
+      "$ref": "#/$defs/isolation"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -84,6 +102,13 @@
         },
         "untrusted": {
           "type": "boolean"
+        },
+        "svidClaims": {
+          "$ref": "#/$defs/modelClaims"
+        },
+        "toolScope": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
         }
       }
     },
@@ -204,6 +229,10 @@
         },
         "approvedEgress": {
           "type": "boolean"
+        },
+        "toolScope": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
         }
       },
       "allOf": [
@@ -281,8 +310,273 @@
               "action"
             ]
           }
+        },
+        {
+          "if": {
+            "required": [
+              "toolScope"
+            ]
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "http"
+              },
+              "deny": {
+                "const": false
+              }
+            }
+          }
         }
       ]
+    },
+    "modelClaims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "model_id",
+        "tool_scopes",
+        "delegator_sub"
+      ],
+      "properties": {
+        "model_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "tool_scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "delegator_sub": {
+          "type": "string",
+          "pattern": "^spiffe://[a-z0-9.-]+/.+$"
+        }
+      }
+    },
+    "jwtAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issuer",
+        "jwksURI"
+      ],
+      "properties": {
+        "issuer": {
+          "type": "string",
+          "pattern": "^https://[^/?#]+(?:/[^?#]*)?$"
+        },
+        "jwksURI": {
+          "type": "string",
+          "pattern": "^https://[^/?#]+(?:/[^?#]*)?$"
+        }
+      }
+    },
+    "httpRoute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "namespace",
+        "gateway",
+        "listener",
+        "backend",
+        "service",
+        "hostname",
+        "port",
+        "method",
+        "path"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "namespace": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "gateway": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "listener": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "backend": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "service": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "hostname": {
+          "type": "string",
+          "pattern": "^[a-z0-9.-]+\\.[a-z0-9.-]+$"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "method": {
+          "enum": [
+            "GET",
+            "HEAD",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS"
+          ]
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^(/[A-Za-z0-9._~-]+)*/?$"
+        }
+      }
+    },
+    "referenceGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "namespace",
+        "fromNamespace",
+        "service"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "namespace": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "fromNamespace": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "service": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        }
+      }
+    },
+    "envoyAdmin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workload",
+        "address",
+        "isolated"
+      ],
+      "properties": {
+        "workload": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "address": {
+          "type": "string",
+          "minLength": 1
+        },
+        "isolated": {
+          "type": "boolean"
+        }
+      }
+    },
+    "tlsSecretSync": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceNamespace",
+        "sourceName",
+        "targetNamespace",
+        "targetName"
+      ],
+      "properties": {
+        "sourceNamespace": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "sourceName": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
+        },
+        "targetNamespace": {
+          "type": "string",
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+        },
+        "targetName": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$"
+        }
+      }
+    },
+    "ipBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy",
+        "cidr"
+      ],
+      "properties": {
+        "policy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "cidr": {
+          "type": "string",
+          "minLength": 1
+        },
+        "except": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "isolation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "envoyAdmins": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/envoyAdmin"
+          }
+        },
+        "tlsSecretSyncs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/tlsSecretSync"
+          }
+        },
+        "clusterCIDRs": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "ipBlocks": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ipBlock"
+          }
+        }
+      }
     }
   }
 }

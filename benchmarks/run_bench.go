@@ -20,10 +20,39 @@ func topology(n int) intent.Intent {
 		TrustDomain: "cluster.local",
 		SPIREParent: "spiffe://cluster.local/spire/agent/benchmark",
 		Resources:   []intent.Resource{{ID: "metadata", Kind: "metadata", Value: "169.254.169.254"}},
+		JWTAuthority: &intent.JWTAuthority{
+			Issuer: "https://identity.example.com", JWKSURI: "https://identity.example.com/jwks.json",
+		},
+		HTTPRoutes: []intent.HTTPRoute{
+			{Name: "catalog", Namespace: "edge", Gateway: "gateway", Listener: "https",
+				Hostname: "catalog.example.com", Backend: "catalog", Service: "catalog",
+				Port: 8080, Method: "GET", Path: "/status"},
+		},
+		ReferenceGrants: []intent.ReferenceGrant{
+			{Name: "catalog-from-edge", Namespace: "benchmark", FromNamespace: "edge", Service: "catalog"},
+		},
+		Isolation: &intent.IsolationInventory{
+			EnvoyAdmins:  []intent.EnvoyAdmin{{Workload: "gateway", Address: "127.0.0.1:15000", Isolated: true}},
+			ClusterCIDRs: []string{"10.42.0.0/16"},
+			IPBlocks:     []intent.IPBlock{{Policy: "edge/partner-egress", CIDR: "198.51.100.0/24"}},
+		},
 	}
-	for i := range n {
+	in.Workloads = []intent.Workload{
+		{ID: "gateway", Namespace: "edge", ServiceAccount: "gateway", Tenant: "benchmark", SVIDTTL: 900, Ingress: true},
+		{ID: "catalog", Namespace: "benchmark", ServiceAccount: "catalog", Tenant: "benchmark", SVIDTTL: 900},
+		{ID: "agent", Namespace: "benchmark", ServiceAccount: "agent", Tenant: "benchmark", SVIDTTL: 900, Untrusted: true,
+			Claims: &intent.ModelClaims{ModelID: "catalog-model:v2", ToolScopes: []string{"lookup"}, DelegatorSub: "spiffe://cluster.local/platform/delegator"}},
+		{ID: "tool", Namespace: "tools", ServiceAccount: "tool", Tenant: "benchmark", SVIDTTL: 900, ToolScope: "lookup"},
+	}
+	in.Rules = []intent.Rule{
+		{Pair: intent.Pair{From: "gateway", To: "catalog"}, Kind: "http", Port: 8080, Method: "GET", Path: "/status"},
+		{Pair: intent.Pair{From: "agent", To: "tool"}, Kind: "http", Port: 8080, Method: "POST", Path: "/lookup", ToolScope: "lookup"},
+	}
+	in.NeverReach = []intent.Pair{{From: "agent", To: "metadata"}, {From: "gateway", To: "tool"}}
+	ringSize := n - len(in.Workloads)
+	for i := range ringSize {
 		id := fmt.Sprintf("service-%04d", i)
-		next := fmt.Sprintf("service-%04d", (i+1)%n)
+		next := fmt.Sprintf("service-%04d", (i+1)%ringSize)
 		in.Workloads = append(in.Workloads, intent.Workload{
 			ID: id, Namespace: "benchmark", ServiceAccount: id, Tenant: "benchmark",
 			SVIDTTL: 900, Ingress: i%50 == 0, Untrusted: i%100 == 0,
@@ -61,6 +90,7 @@ func main() {
 	fmt.Println("# Benchmark results")
 	fmt.Println()
 	fmt.Printf("%s, %s/%s, GOMAXPROCS=%d. %d timed runs per row after three warm-ups.\n", runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.GOMAXPROCS(0), runs)
+	fmt.Println("Each topology includes a cross-namespace Gateway route, a JWT-SVID tool edge and a sparse service ring.")
 	fmt.Println("Compile includes proof and in-memory rendering. Allocation is mean Go heap allocation per run.")
 	fmt.Println()
 	fmt.Println("| Workload nodes | Operation | p50 (ms) | p95 (ms) | p99 (ms) | Allocated (MiB/run) |")

@@ -33,4 +33,9 @@ jobs:
           go run ./cmd/aegismesh drift -intent examples/multitenant.json -live "${RUNNER_TEMP}/aegismesh/verified-live.json"
           terraform -chdir="${RUNNER_TEMP}/aegismesh" init -backend=false -input=false
           terraform -chdir="${RUNNER_TEMP}/aegismesh" validate
+      - name: Compile and validate Wave 3 example
+        run: |
+          go run ./cmd/aegismesh compile -intent examples/wave3.json -previous-tf examples/legacy-iam.tf.json -out "${RUNNER_TEMP}/aegismesh-wave3"
+          python tests/validate_artifacts.py "${RUNNER_TEMP}/aegismesh-wave3" --example wave3.json
+          go run ./cmd/aegismesh drift -intent examples/wave3.json -live "${RUNNER_TEMP}/aegismesh-wave3/verified-live.json"
       - run: go run ./benchmarks/run_bench.go

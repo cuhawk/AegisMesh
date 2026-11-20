@@ -154,6 +154,9 @@ func writeBundle(out, previous string, b compiler.Bundle) error {
 		"iam.tf.json":        b.Terraform,
 		"spire-entries.json": map[string]any{"entries": b.SPIRE},
 	}
+	if len(b.ToolAuthorizations) != 0 {
+		artifacts["tool-authorization-data.json"] = map[string]any{"aegismesh_tool_authorizations": b.ToolAuthorizations}
+	}
 	for name, policy := range b.IAM {
 		artifacts["iam-"+name+".json"] = policy
 	}

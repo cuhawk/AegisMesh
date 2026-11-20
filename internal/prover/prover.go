@@ -117,6 +117,8 @@ func Check(in intent.Intent) []Finding {
 		identities[identity] = w.ID
 		kinds[w.ID], workloads[w.ID] = "workload", w
 	}
+	tools := checkIdentity(in, add)
+	checkIsolation(in.Isolation, workloads, add)
 	for _, resource := range in.Resources {
 		valid := false
 		switch resource.Kind {
@@ -164,6 +166,17 @@ func Check(in intent.Intent) []Finding {
 			add(msg, r.From, r.To)
 			continue
 		}
+		fromWorkload, toWorkload := workloads[r.From], workloads[r.To]
+		if !r.Deny && tools[r.To] {
+			if r.Kind != "http" || fromWorkload.Claims == nil || r.ToolScope != toWorkload.ToolScope ||
+				!slices.Contains(fromWorkload.Claims.ToolScopes, r.ToolScope) {
+				add("agent-to-tool edge lacks scoped model identity", r.From, r.To)
+				continue
+			}
+		} else if r.ToolScope != "" {
+			add("unexpected tool scope on edge", r.From, r.To)
+			continue
+		}
 		if !r.Deny && r.Kind == "http" && workloads[r.From].Tenant != workloads[r.To].Tenant {
 			add("cross-tenant HTTP allow", r.From, r.To)
 		}
@@ -194,6 +207,10 @@ func Check(in intent.Intent) []Finding {
 		assumedRoles[r.From], trustedRoles[r.To] = r.To, true
 	}
 	graph := make(map[string][]string)
+	toolCalls := make(map[string][]intent.Rule)
+	allowedToolCalls := make(map[match]bool)
+	predecessors := make(map[string][]string)
+	gatewayEdges := make(map[gatewayMatch]bool)
 	for _, r := range in.Rules {
 		st := states[key(r)]
 		if r.Deny || !st.allow {
@@ -207,7 +224,21 @@ func Check(in intent.Intent) []Finding {
 			add("role grants access without managed trust", r.From, r.To)
 		}
 		graph[r.From] = append(graph[r.From], r.To)
+		if len(tools) != 0 {
+			predecessors[r.To] = append(predecessors[r.To], r.From)
+		}
+		if r.Kind == "http" {
+			if len(in.HTTPRoutes) != 0 {
+				gatewayEdges[gatewayMatch{r.From, r.To, r.Method, r.Path, r.Port}] = true
+			}
+			if tools[r.To] {
+				toolCalls[r.From] = append(toolCalls[r.From], r)
+				allowedToolCalls[key(r)] = true
+			}
+		}
 	}
+	checkGateway(in, workloads, gatewayEdges, add)
+	canReachTools := toolAncestors(tools, predecessors)
 	for from := range graph {
 		slices.Sort(graph[from])
 	}
@@ -227,7 +258,7 @@ func Check(in intent.Intent) []Finding {
 	slices.Sort(sources)
 	for _, id := range sources {
 		w := workloads[id]
-		if !w.Ingress && !w.Untrusted && len(queries[id]) == 0 {
+		if !w.Ingress && !w.Untrusted && len(queries[id]) == 0 && (!canReachTools[id] || w.ID == "") {
 			continue
 		}
 		previous := map[string]string{id: ""}
@@ -244,6 +275,15 @@ func Check(in intent.Intent) []Finding {
 		for head := 0; head < len(queue); head++ {
 			current := queue[head]
 			kind := kinds[current]
+			if current != id && w.ID != "" {
+				for _, call := range toolCalls[current] {
+					tool := call.To
+					call.From = id
+					if !allowedToolCalls[key(call)] {
+						add("tool reachable through an unauthorized deputy", append(witness(current), tool)...)
+					}
+				}
+			}
 			if vault == "" && (kind == "vault" || kind == "object") {
 				vault = current
 			}
