@@ -11,6 +11,10 @@ import yaml
 
 CILIUM = "https://raw.githubusercontent.com/cilium/cilium/v1.19.6/pkg/k8s/apis/cilium.io/client/crds/v2/"
 ISTIO = "https://raw.githubusercontent.com/istio/istio/1.31.4/manifests/charts/base/files/crd-all.gen.yaml"
+TETRAGON = (
+    "https://raw.githubusercontent.com/cilium/tetragon/v1.5.0/pkg/k8s/apis/cilium.io/client/"
+    "crds/v1alpha1/cilium.io_tracingpoliciesnamespaced.yaml"
+)
 GATEWAY = "https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/v1.3.0/config/crd/standard/"
 KUBERNETES = (
     "https://raw.githubusercontent.com/yannh/kubernetes-json-schema/"
@@ -73,6 +77,8 @@ def validate_gate(artifact_dir, original):
             lambda b: route(b)["spec"]["rules"][0]["backendRefs"][0].update(namespace="wrong"),
             lambda b: route(b)["spec"]["rules"][0]["matches"][0]["path"].update(type="PathPrefix"),
         ])
+    if original.get("clusters"):
+        mutations.append(lambda b: b["clusters"]["west"]["kubernetes"].pop(0))
     for number, mutate in enumerate(mutations, 1):
         altered = copy.deepcopy(original)
         mutate(altered)
@@ -134,15 +140,130 @@ def validate_tool_requests(artifact_dir, bundle):
     return len(mutations), 2
 
 
+def validate_deployment(directory, bundle, schemas, workloads, trust_domain, parent, peers):
+    count = 0
+    profiles = [("kubernetes.yaml", "kubernetes"), ("cilium-http.yaml", "ciliumHTTP")]
+    if bundle.get("tetragon"):
+        profiles.append(("tetragon.yaml", "tetragon"))
+    else:
+        assert not (directory / "tetragon.yaml").exists()
+    for filename, field in profiles:
+        objects = list(yaml.safe_load_all((directory / filename).read_text()))
+        assert objects == bundle[field], filename
+        for obj in objects:
+            jsonschema.Draft7Validator(schemas[obj["apiVersion"], obj["kind"]]).validate(obj)
+            count += 1
+
+    # Exercise drift against an inventory shaped like kubectl's List.
+    live = directory / "verified-live.json"
+    live.write_text(json.dumps({
+        "apiVersion": "v1", "kind": "List", "items": bundle["kubernetes"] + bundle.get("tetragon", []),
+    }))
+    entries = json.loads((directory / "spire-entries.json").read_text())["entries"]
+    assert entries == bundle["spire"]
+    expected_ids = {
+        f'spiffe://{trust_domain}/ns/{w["namespace"]}/sa/{w["serviceAccount"]}' for w in workloads
+    }
+    assert {entry["spiffe_id"] for entry in entries} == expected_ids
+    for entry in entries:
+        assert 0 < entry["x509_svid_ttl"] <= 3600 and len(entry["selectors"]) == 2
+        assert entry["parent_id"] == parent
+        assert entry.get("federates_with", []) == sorted(peers)
+    expected_runtime = {w["id"]: w for w in workloads if "execAllowlist" in w}
+    assert {obj["metadata"]["name"] for obj in bundle.get("tetragon", [])} == expected_runtime.keys()
+    for obj in bundle.get("tetragon", []):
+        w = expected_runtime[obj["metadata"]["name"]]
+        assert obj["metadata"]["namespace"] == w["namespace"]
+        assert obj["spec"] == {
+            "podSelector": {"matchLabels": {"aegismesh.io/workload": w["id"]}},
+            "lsmhooks": [{
+                "hook": "bprm_check_security",
+                "args": [{"index": 0, "type": "linux_binprm"}],
+                "selectors": [{
+                    "matchArgs": [{"index": 0, "operator": "NotEqual", "values": sorted(w["execAllowlist"])}],
+                    "matchActions": [{"action": "Override", "argError": -13}],
+                }],
+            }],
+        }
+    return count
+
+
+def validate_federation(directory, bundle, schemas, example):
+    domains = example["federation"]["trustDomains"]
+    assert set(bundle["clusters"]) == {value["cluster"] for value in domains.values()}
+    assert not (directory / "kubernetes.yaml").exists()
+    workloads = {w["id"]: w for w in example["workloads"]}
+    domain_by_workload = {w["id"]: w.get("trustDomain", example["trustDomain"]) for w in workloads.values()}
+    count = 0
+    for trust_domain, binding in domains.items():
+        cluster = binding["cluster"]
+        local = bundle["clusters"][cluster]
+        local_dir = directory / "clusters" / cluster
+        peers = binding.get("trusts", [])
+        trust_map = {
+            "trustDomain": trust_domain, "bundleEndpoint": binding["bundleEndpoint"],
+            "trustedBundles": {peer: domains[peer]["bundleEndpoint"] for peer in peers},
+        }
+        assert json.loads((local_dir / "spire-bundles.json").read_text()) == trust_map
+        assert all(local[key] == value for key, value in trust_map.items())
+        members = [w for w in workloads.values() if domain_by_workload[w["id"]] == trust_domain]
+        count += validate_deployment(local_dir, local, schemas, members, trust_domain, binding["spireParent"], peers)
+
+        def policies(objects, kind):
+            return {obj["metadata"]["name"]: obj["spec"] for obj in objects if obj["kind"] == kind}
+
+        network = policies(local["kubernetes"], "CiliumNetworkPolicy")
+        auth = policies(local["kubernetes"], "AuthorizationPolicy")
+        plaintext = policies(local["ciliumHTTP"], "CiliumNetworkPolicy")
+        assert set(network) == set(auth) == set(plaintext) == {w["id"] for w in members}
+        for spec in plaintext.values():
+            for direction, field in [("ingress", "fromEndpoints"), ("egress", "toEndpoints")]:
+                for rule in spec[direction]:
+                    for endpoint in rule.get(field, []):
+                        assert endpoint["matchLabels"].get("io.cilium.k8s.policy.cluster", cluster) == cluster
+        for rule in example["rules"]:
+            source, target = rule["from"], rule["to"]
+            if rule["kind"] != "http" or rule.get("deny") or domain_by_workload[target] != trust_domain:
+                continue
+            source_domain = domain_by_workload[source]
+            remote = workloads[source]
+            principal = f'{source_domain}/ns/{remote["namespace"]}/sa/{remote["serviceAccount"]}'
+            assert any(item["from"][0]["source"]["principals"] == [principal] for item in auth[target]["rules"])
+            labels = {
+                "io.cilium.k8s.policy.cluster": domains[source_domain]["cluster"],
+                "io.cilium.k8s.policy.serviceaccount": remote["serviceAccount"],
+                "k8s:io.kubernetes.pod.namespace": remote["namespace"],
+            }
+            assert any(item.get("fromEndpoints") == [{"matchLabels": labels}] for item in network[target]["ingress"])
+    return count
+
+
+def validate_diff(directory, bundle):
+    changes = json.loads((directory / "policy-diff.json").read_text())
+    assert changes == sorted(changes, key=lambda change: change["path"])
+    by_path = {change["path"]: change for change in changes}
+    assert by_path["clusters"] == {"path": "clusters", "action": "added", "after": bundle["clusters"]}
+    assert by_path["spire"]["action"] == "modified"
+    assert by_path["spire"]["before"] != by_path["spire"]["after"] == bundle["spire"]
+    assert by_path["tetragon"]["after"] == bundle["tetragon"]
+    assert "terraform" not in by_path
+    page = (directory / "index.html").read_text()
+    assert all(value in page for value in ["<h3>Before</h3>", "<h3>After</h3>", "policy-diff.json", "west.example.org"])
+    print(f"Policy diff validated {len(changes)} changed sections in JSON and HTML.")
+
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=Path)
     parser.add_argument("--example", default="multitenant.json")
+    parser.add_argument("--diff-dir", type=Path)
     args = parser.parse_args()
     root = Path(__file__).resolve().parent.parent
     schema = json.loads((root / "schemas/intent.schema.json").read_text())
     jsonschema.Draft202012Validator.check_schema(schema)
-    jsonschema.validate(json.loads((root / "examples" / args.example).read_text()), schema)
+    example = json.loads((root / "examples" / args.example).read_text())
+    jsonschema.validate(example, schema)
 
     schemas = dict(crd_schemas(CILIUM + "ciliumnetworkpolicies.yaml"))
     schemas.update(crd_schemas(CILIUM + "ciliumclusterwidenetworkpolicies.yaml"))
@@ -152,21 +273,16 @@ def main():
     if any(o["kind"] == "HTTPRoute" for o in bundle["kubernetes"]):
         for kind in ("httproutes", "referencegrants"):
             schemas.update(crd_schemas(GATEWAY + f"gateway.networking.k8s.io_{kind}.yaml"))
-    count = 0
-    for filename, field in [("kubernetes.yaml", "kubernetes"), ("cilium-http.yaml", "ciliumHTTP")]:
-        objects = list(yaml.safe_load_all((args.directory / filename).read_text()))
-        assert objects == bundle[field], filename
-        for obj in objects:
-            jsonschema.Draft7Validator(schemas[obj["apiVersion"], obj["kind"]]).validate(obj)
-            count += 1
+    if bundle.get("tetragon"):
+        schemas.update(crd_schemas(TETRAGON))
+    if bundle.get("clusters"):
+        count = validate_federation(args.directory, bundle, schemas, example)
+    else:
+        count = validate_deployment(args.directory, bundle, schemas, example["workloads"],
+                                    example["trustDomain"], example["spireParent"], [])
+    if args.diff_dir:
+        validate_diff(args.diff_dir, bundle)
 
-    # Exercise the drift command using an export shaped like kubectl's List.
-    live = args.directory / "verified-live.json"
-    live.write_text(json.dumps({"apiVersion": "v1", "kind": "List", "items": bundle["kubernetes"]}))
-
-    entries = json.loads((args.directory / "spire-entries.json").read_text())["entries"]
-    assert entries == bundle["spire"]
-    assert all(0 < entry["x509_svid_ttl"] <= 3600 and len(entry["selectors"]) == 2 for entry in entries)
     terraform = json.loads((args.directory / "iam.tf.json").read_text())
     assert terraform == bundle["terraform"]
     for role, entry in terraform["resource"]["aws_iam_role"].items():

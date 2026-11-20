@@ -38,4 +38,12 @@ jobs:
           go run ./cmd/aegismesh compile -intent examples/wave3.json -previous-tf examples/legacy-iam.tf.json -out "${RUNNER_TEMP}/aegismesh-wave3"
           python tests/validate_artifacts.py "${RUNNER_TEMP}/aegismesh-wave3" --example wave3.json
           go run ./cmd/aegismesh drift -intent examples/wave3.json -live "${RUNNER_TEMP}/aegismesh-wave3/verified-live.json"
+      - name: Compile and validate Wave 4 federation, runtime policy and revision diff
+        run: |
+          go run ./cmd/aegismesh compile -intent examples/wave4.json -previous-tf examples/legacy-iam.tf.json -out "${RUNNER_TEMP}/aegismesh-wave4"
+          go run ./cmd/aegismesh --diff "${RUNNER_TEMP}/aegismesh-wave3/bundle.json" "${RUNNER_TEMP}/aegismesh-wave4/bundle.json" -out "${RUNNER_TEMP}/aegismesh-diff"
+          python tests/validate_artifacts.py "${RUNNER_TEMP}/aegismesh-wave4" --example wave4.json --diff-dir "${RUNNER_TEMP}/aegismesh-diff"
+          for cluster in east west; do
+            go run ./cmd/aegismesh drift -intent examples/wave4.json -cluster "$cluster" -live "${RUNNER_TEMP}/aegismesh-wave4/clusters/$cluster/verified-live.json"
+          done
       - run: go run ./benchmarks/run_bench.go

@@ -37,12 +37,21 @@ func topology(n int) intent.Intent {
 			IPBlocks:     []intent.IPBlock{{Policy: "edge/partner-egress", CIDR: "198.51.100.0/24"}},
 		},
 	}
+	in.Federation = &intent.Federation{
+		TrustDomains: map[string]intent.TrustDomain{
+			in.TrustDomain: {Cluster: "east", SPIREParent: in.SPIREParent,
+				BundleEndpoint: "https://bundle.east.example.org", Trusts: []string{"west.example.org"}},
+			"west.example.org": {Cluster: "west", SPIREParent: "spiffe://west.example.org/spire/agent/benchmark",
+				BundleEndpoint: "https://bundle.west.example.org", Trusts: []string{in.TrustDomain}},
+		},
+		AllowReach: []intent.Pair{{From: "agent", To: "tool"}},
+	}
 	in.Workloads = []intent.Workload{
 		{ID: "gateway", Namespace: "edge", ServiceAccount: "gateway", Tenant: "benchmark", SVIDTTL: 900, Ingress: true},
 		{ID: "catalog", Namespace: "benchmark", ServiceAccount: "catalog", Tenant: "benchmark", SVIDTTL: 900},
 		{ID: "agent", Namespace: "benchmark", ServiceAccount: "agent", Tenant: "benchmark", SVIDTTL: 900, Untrusted: true,
 			Claims: &intent.ModelClaims{ModelID: "catalog-model:v2", ToolScopes: []string{"lookup"}, DelegatorSub: "spiffe://cluster.local/platform/delegator"}},
-		{ID: "tool", Namespace: "tools", ServiceAccount: "tool", Tenant: "benchmark", SVIDTTL: 900, ToolScope: "lookup"},
+		{ID: "tool", Namespace: "tools", ServiceAccount: "tool", Tenant: "benchmark", SVIDTTL: 900, ToolScope: "lookup", TrustDomain: "west.example.org"},
 	}
 	in.Rules = []intent.Rule{
 		{Pair: intent.Pair{From: "gateway", To: "catalog"}, Kind: "http", Port: 8080, Method: "GET", Path: "/status"},
@@ -53,6 +62,15 @@ func topology(n int) intent.Intent {
 	for i := range ringSize {
 		id := fmt.Sprintf("service-%04d", i)
 		next := fmt.Sprintf("service-%04d", (i+1)%ringSize)
+		in.Federation = &intent.Federation{
+			TrustDomains: map[string]intent.TrustDomain{
+				in.TrustDomain: {Cluster: "east", SPIREParent: in.SPIREParent,
+					BundleEndpoint: "https://bundle.east.example.org", Trusts: []string{"west.example.org"}},
+				"west.example.org": {Cluster: "west", SPIREParent: "spiffe://west.example.org/spire/agent/benchmark",
+					BundleEndpoint: "https://bundle.west.example.org", Trusts: []string{in.TrustDomain}},
+			},
+			AllowReach: []intent.Pair{{From: "agent", To: "tool"}},
+		}
 		in.Workloads = append(in.Workloads, intent.Workload{
 			ID: id, Namespace: "benchmark", ServiceAccount: id, Tenant: "benchmark",
 			SVIDTTL: 900, Ingress: i%50 == 0, Untrusted: i%100 == 0,
@@ -63,6 +81,9 @@ func topology(n int) intent.Intent {
 		if i%50 == 0 {
 			in.NeverReach = append(in.NeverReach, intent.Pair{From: id, To: "metadata"})
 		}
+	}
+	for i := range in.Workloads {
+		in.Workloads[i].ExecAllowlist = []string{"/usr/bin/tini", "/app/service"}
 	}
 	return in
 }
@@ -90,7 +111,7 @@ func main() {
 	fmt.Println("# Benchmark results")
 	fmt.Println()
 	fmt.Printf("%s, %s/%s, GOMAXPROCS=%d. %d timed runs per row after three warm-ups.\n", runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.GOMAXPROCS(0), runs)
-	fmt.Println("Each topology includes a cross-namespace Gateway route, a JWT-SVID tool edge and a sparse service ring.")
+	fmt.Println("Each topology includes a cross-namespace Gateway route, a federated JWT-SVID tool edge, a sparse service ring and an executable allowlist per workload.")
 	fmt.Println("Compile includes proof and in-memory rendering. Allocation is mean Go heap allocation per run.")
 	fmt.Println()
 	fmt.Println("| Workload nodes | Operation | p50 (ms) | p95 (ms) | p99 (ms) | Allocated (MiB/run) |")

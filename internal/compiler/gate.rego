@@ -175,7 +175,7 @@ deny contains msg if {
 
 strict_cilium_http(rule) if {
 	count(rule.fromEndpoints) == 1
-	count(rule.fromEndpoints[0].matchLabels) == 2
+	valid_cilium_peer_labels(rule.fromEndpoints[0].matchLabels)
 	rule.fromEndpoints[0].matchLabels["k8s:io.kubernetes.pod.namespace"] != ""
 	rule.fromEndpoints[0].matchLabels["io.cilium.k8s.policy.serviceaccount"] != ""
 	count(rule.toPorts) == 1
@@ -185,6 +185,24 @@ strict_cilium_http(rule) if {
 	startswith(http.path, "^/")
 	endswith(http.path, "$")
 	not contains(http.path, "*")
+}
+
+valid_cilium_peer_labels(labels) if {
+	count(object.get(input, "clusters", {})) == 0
+	count(labels) == 2
+}
+
+valid_cilium_peer_labels(labels) if {
+	count(labels) == 3
+	cluster := labels["io.cilium.k8s.policy.cluster"]
+	is_object(input.clusters[cluster])
+}
+
+deny contains msg if {
+	some name, cluster in object.get(input, "clusters", {})
+	some profile in ["kubernetes", "ciliumHTTP"]
+	not isolation_present(cluster[profile])
+	msg := sprintf("missing isolation: %s/%s", [name, profile])
 }
 
 deny contains "invalid Terraform IAM configuration" if {
