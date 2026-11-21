@@ -4,6 +4,7 @@ import copy
 import json
 from pathlib import Path
 import subprocess
+from tempfile import TemporaryDirectory
 from urllib.request import urlopen
 
 import jsonschema
@@ -14,6 +15,10 @@ ISTIO = "https://raw.githubusercontent.com/istio/istio/1.31.4/manifests/charts/b
 TETRAGON = (
     "https://raw.githubusercontent.com/cilium/tetragon/v1.5.0/pkg/k8s/apis/cilium.io/client/"
     "crds/v1alpha1/cilium.io_tracingpoliciesnamespaced.yaml"
+)
+KYVERNO = (
+    "https://raw.githubusercontent.com/kyverno/kyverno/v1.16.0/config/crds/"
+    "policies.kyverno.io/policies.kyverno.io_validatingpolicies.yaml"
 )
 GATEWAY = "https://raw.githubusercontent.com/kubernetes-sigs/gateway-api/v1.3.0/config/crd/standard/"
 KUBERNETES = (
@@ -40,9 +45,20 @@ def validate_gate(artifact_dir, original):
     gate = artifact_dir / "gate.rego"
     subprocess.run(["opa", "check", "--strict", gate], check=True)
 
-    def evaluate(data, expected, case):
+    sources = ["-d", gate]
+    if original.get("wave6"):
+        contract = artifact_dir / "wave6-policy-data.json"
+        assert json.loads(contract.read_text())["aegismesh_wave6"] == original
+        sources.extend(["-d", contract])
         result = subprocess.run(
             ["opa", "eval", "--format=raw", "--stdin-input", "-d", gate, "data.aegismesh.allow"],
+            input=json.dumps(original), capture_output=True, text=True, check=True,
+        )
+        assert result.stdout.strip() == "false", "Wave 6 bundle passed without its policy data"
+
+    def evaluate(data, expected, case):
+        result = subprocess.run(
+            ["opa", "eval", "--format=raw", "--stdin-input", *sources, "data.aegismesh.allow"],
             input=json.dumps(data), capture_output=True, text=True, check=True,
         )
         assert result.stdout.strip() == expected, (case, result.stdout, result.stderr)
@@ -79,12 +95,41 @@ def validate_gate(artifact_dir, original):
         ])
     if original.get("clusters"):
         mutations.append(lambda b: b["clusters"]["west"]["kubernetes"].pop(0))
+    if original.get("wave6"):
+        def admission(b):
+            return next(p for p in b["kubernetes"] if p["kind"] == "ValidatingPolicy")
+
+        def gcp_binding(b):
+            return next(iter(b["terraform"]["resource"]["google_project_iam_binding"].values()))
+
+        def gcp_perimeter(b):
+            return next(iter(b["terraform"]["resource"]["google_access_context_manager_service_perimeter"].values()))
+
+        def egress(b):
+            return next(p for p in b["kubernetes"] if p["kind"] == "CiliumNetworkPolicy"
+                        and p["metadata"]["name"] == "catalog")["spec"]["egress"]
+
+        mutations.extend([
+            lambda b: b.pop("wave6"),
+            lambda b: admission(b)["spec"].update(validationActions=["Audit"]),
+            lambda b: admission(b)["spec"]["validations"].pop(),
+            lambda b: admission(b)["spec"]["matchConditions"].clear(),
+            lambda b: gcp_binding(b).update(role="roles/owner"),
+            lambda b: gcp_binding(b)["members"].append("allUsers"),
+            lambda b: gcp_perimeter(b).update(use_explicit_dry_run_spec=True, status={}),
+            lambda b: gcp_perimeter(b)["status"].update(restricted_services=[]),
+            lambda b: b["mcpAuthorizations"][1].update(mode="read-only"),
+            lambda b: b["mcpAuthorizations"][0].update(path="/admin"),
+            lambda b: next(p for p in b["tetragon"] if p["metadata"]["name"] == "agent")["spec"].pop("kprobes"),
+            lambda b: egress(b)[1]["toFQDNs"][0].update(matchName="unapproved.example.com"),
+            lambda b: egress(b)[2]["toPorts"][0]["rules"]["dns"][0].update(matchName="other.example.com"),
+        ])
     for number, mutate in enumerate(mutations, 1):
         altered = copy.deepcopy(original)
         mutate(altered)
         evaluate(altered, "false", number)
         result = subprocess.run(
-            ["opa", "eval", "--format=raw", "--stdin-input", "-d", gate, "data.aegismesh.deny"],
+            ["opa", "eval", "--format=raw", "--stdin-input", *sources, "data.aegismesh.deny"],
             input=json.dumps(altered), capture_output=True, text=True, check=True,
         )
         assert json.loads(result.stdout), (number, "missing Rego denial witness")
@@ -171,10 +216,11 @@ def validate_deployment(directory, bundle, schemas, workloads, trust_domain, par
         assert entry.get("federates_with", []) == sorted(peers)
     expected_runtime = {w["id"]: w for w in workloads if "execAllowlist" in w}
     assert {obj["metadata"]["name"] for obj in bundle.get("tetragon", [])} == expected_runtime.keys()
+    agent_ids = {w["id"] for w in workloads if w.get("admission")}
     for obj in bundle.get("tetragon", []):
         w = expected_runtime[obj["metadata"]["name"]]
         assert obj["metadata"]["namespace"] == w["namespace"]
-        assert obj["spec"] == {
+        expected = {
             "podSelector": {"matchLabels": {"aegismesh.io/workload": w["id"]}},
             "lsmhooks": [{
                 "hook": "bprm_check_security",
@@ -185,6 +231,21 @@ def validate_deployment(directory, bundle, schemas, workloads, trust_domain, par
                 }],
             }],
         }
+        if "kprobes" in obj["spec"]:
+            assert w["id"] in agent_ids
+            expected["kprobes"] = [{
+                "call": "security_socket_connect", "syscall": False,
+                "args": [{"index": 0, "type": "socket"}, {"index": 1, "type": "sockaddr"}],
+                "selectors": [{
+                    "matchArgs": [
+                        {"index": 0, "operator": "Protocol", "values": ["IPPROTO_TCP"]},
+                        {"index": 1, "operator": "Family", "values": ["AF_INET", "AF_INET6"]},
+                        {"index": 1, "operator": "SPort", "values": ["443"]},
+                    ],
+                    "matchActions": [{"action": "Override", "argError": -13}],
+                }],
+            }]
+        assert obj["spec"] == expected
     return count
 
 
@@ -253,6 +314,158 @@ def validate_diff(directory, bundle):
 
 
 
+def validate_wave6(directory, bundle, example):
+    by_id = {workload["id"]: workload for workload in example["workloads"]}
+    resources = {resource["id"]: resource["value"] for resource in example["resources"]}
+
+    def spiffe(name):
+        workload = by_id[name]
+        trust_domain = workload.get("trustDomain", example["trustDomain"])
+        return f'spiffe://{trust_domain}/ns/{workload["namespace"]}/sa/{workload["serviceAccount"]}'
+
+    gcp = example["gcp"]
+    terraform = bundle["terraform"]["resource"]
+    iam = terraform["google_project_iam_binding"]
+    for grant in gcp["bindings"]:
+        project, workload = gcp["projects"][grant["project"]], by_id[grant["workload"]]
+        principal = (
+            f'principal://iam.googleapis.com/projects/{project["number"]}/locations/global/'
+            f'workloadIdentityPools/{project["id"]}.svc.id.goog/subject/'
+            f'ns/{workload["namespace"]}/sa/{workload["serviceAccount"]}'
+        )
+        assert any(binding["project"] == project["id"] and binding["role"] == grant["role"]
+                   and principal in binding["members"] for binding in iam.values())
+    for name, perimeter in gcp["perimeters"].items():
+        parent = f'accessPolicies/{perimeter["accessPolicy"]}'
+        assert terraform["google_access_context_manager_service_perimeter"][name] == {
+            "name": f"{parent}/servicePerimeters/{name}", "parent": parent, "title": name,
+            "perimeter_type": "PERIMETER_TYPE_REGULAR",
+            "status": {
+                "resources": sorted(f'projects/{gcp["projects"][key]["number"]}' for key in perimeter["projects"]),
+                "restricted_services": sorted(perimeter["services"]),
+            },
+        }
+
+    entries = bundle["mcpAuthorizations"]
+    expected = []
+    for mcp in example["mcp"]:
+        name = mcp["agent"]
+        upstream = resources[mcp["upstream"]]
+        for profile in ("kubernetes", "ciliumHTTP"):
+            def network(workload):
+                return next(p["spec"] for p in bundle[profile] if p["kind"] == "CiliumNetworkPolicy"
+                            and p["metadata"]["name"] == workload)
+
+            gateway = network(mcp["gateway"])
+            dns, = [rule for rule in gateway["egress"] if "toFQDNs" in rule]
+            assert dns == {"toFQDNs": [{"matchName": upstream}],
+                           "toPorts": [{"ports": [{"port": "443", "protocol": "TCP"}]}]}
+            assert gateway["egress"][-1]["toPorts"][0]["rules"]["dns"] == [{"matchName": upstream}]
+            assert all("toFQDNs" not in rule for rule in network(name)["egress"])
+            if profile == "ciliumHTTP":
+                assert gateway["ingress"] == [{"fromEntities": ["none"]}]
+                assert network(name)["egress"] == [{"toEntities": ["none"]}]
+        assert any(p["metadata"]["name"] == name and p["spec"].get("kprobes") for p in bundle["tetragon"])
+        expected.extend(dict(path, principal=spiffe(name), gateway=spiffe(mcp["gateway"]), upstream=upstream)
+                        for path in mcp["paths"])
+    assert entries == sorted(expected, key=lambda edge: (edge["principal"], edge["method"], edge["path"]))
+
+    def evaluate(request, allowed):
+        result = subprocess.run(
+            ["opa", "eval", "--format=raw", "--stdin-input", "-d", directory / "gate.rego",
+             "-d", directory / "wave6-policy-data.json", "data.aegismesh.allow_mcp"],
+            input=json.dumps(request), capture_output=True, text=True, check=True,
+        )
+        assert result.stdout.strip() == str(allowed).lower(), (request, result.stdout, result.stderr)
+
+    denied = allowed = 0
+    for entry in entries:
+        approval = {key: entry[key] for key in ("principal", "gateway", "method", "path", "upstream")}
+        approval["request_id"] = "request-123"
+        approval["request_digest"] = "a" * 64
+        request = {key: approval[key] for key in ("method", "path", "upstream", "request_id", "request_digest")}
+        request.update(peer_spiffe_id=entry["principal"], gateway_spiffe_id=entry["gateway"])
+        if entry["mode"] == "approval-gated":
+            evaluate(request, False)
+            denied += 1
+            request["verified_approval"] = approval
+            for key in approval:
+                altered = copy.deepcopy(request)
+                altered["verified_approval"][key] = "unrelated"
+                evaluate(altered, False)
+                denied += 1
+        evaluate(request, True)
+        allowed += 1
+        for field, value in [
+            ("peer_spiffe_id", "spiffe://other.example.com/ns/research/sa/agent"),
+            ("gateway_spiffe_id", "spiffe://other.example.com/ns/research/sa/catalog"),
+            ("upstream", entry["upstream"] + ".bad.example.com"),
+            ("method", "TRACE"),
+            ("path", entry["path"] + "/../admin"),
+            ("path", entry["path"] + "?action=publish"),
+        ]:
+            evaluate(dict(request, **{field: value}), False)
+            denied += 1
+    return denied, allowed
+
+
+def validate_admission(bundle, example):
+    policy = next(p for p in bundle["kubernetes"] if p["kind"] == "ValidatingPolicy"
+                  and p["metadata"]["name"] == "research.agent")
+    workload = next(w for w in example["workloads"] if w["id"] == "agent")
+    image = workload["admission"]["registryPrefixes"][0] + "agent:v1"
+    container = {
+        "name": "agent", "image": image,
+        "securityContext": {"readOnlyRootFilesystem": True, "allowPrivilegeEscalation": False},
+    }
+    pod = {
+        "apiVersion": "v1", "kind": "Pod",
+        "metadata": {"name": "sample", "namespace": "research", "labels": {"aegismesh.io/workload": "agent"}},
+        "spec": {"serviceAccountName": "agent", "securityContext": {"runAsNonRoot": True, "runAsUser": 1000},
+                 "containers": [container], "initContainers": [dict(container, name="initialize")]},
+    }
+    mutations = [
+        lambda p: p["spec"]["securityContext"].update(runAsUser=0),
+        lambda p: p["spec"]["securityContext"].pop("runAsNonRoot"),
+        lambda p: p["spec"]["containers"][0]["securityContext"].update(runAsNonRoot=False),
+        lambda p: p["spec"]["containers"][0]["securityContext"].update(readOnlyRootFilesystem=False),
+        lambda p: p["spec"]["initContainers"][0]["securityContext"].update(runAsUser=0),
+        lambda p: p["spec"]["initContainers"][0].update(image="registry.example.net/initialize:v1"),
+        lambda p: p["spec"]["containers"][0].update(image=image.replace("/workloads/", "/workloads-foreign/")),
+        lambda p: p["spec"]["containers"][0]["securityContext"].update(allowPrivilegeEscalation=True),
+        lambda p: p["spec"].update(ephemeralContainers=[dict(container, name="debug", image="registry.example.net/debug:v1")]),
+        lambda p: p["spec"].update(hostNetwork=True),
+        lambda p: p["spec"].update(hostPID=True),
+        lambda p: p["spec"].update(hostIPC=True),
+        lambda p: p["spec"].update(volumes=[{"name": "host", "hostPath": {"path": "/etc"}}]),
+        lambda p: p["spec"].update(serviceAccountName="other"),
+        lambda p: p["metadata"].pop("labels"),
+    ]
+    with TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        policy_file = root / "policy.yaml"
+        policy_file.write_text(yaml.safe_dump(policy))
+
+        def evaluate(value, allowed):
+            resource = root / "pod.yaml"
+            resource.write_text(yaml.safe_dump(value))
+            result = subprocess.run(
+                ["kyverno", "apply", policy_file, "--resource", resource],
+                capture_output=True, text=True,
+            )
+            summary = "pass: 1, fail: 0" if allowed else "pass: 0, fail: 1"
+            assert result.returncode == (0 if allowed else 1) and summary in result.stdout, (
+                value, result.returncode, result.stdout, result.stderr,
+            )
+
+        evaluate(pod, True)
+        for mutate in mutations:
+            altered = copy.deepcopy(pod)
+            mutate(altered)
+            evaluate(altered, False)
+    return len(mutations)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directory", type=Path)
@@ -275,6 +488,8 @@ def main():
             schemas.update(crd_schemas(GATEWAY + f"gateway.networking.k8s.io_{kind}.yaml"))
     if bundle.get("tetragon"):
         schemas.update(crd_schemas(TETRAGON))
+    if any(o["kind"] == "ValidatingPolicy" for o in bundle["kubernetes"]):
+        schemas.update(crd_schemas(KYVERNO))
     if bundle.get("clusters"):
         count = validate_federation(args.directory, bundle, schemas, example)
     else:
@@ -299,6 +514,11 @@ def main():
     print(f"{args.example}: validated {count} Kubernetes manifests, intent and IAM migration. "
           f"Observed {rejections} Rego artifact rejections with witnesses and "
           f"{denied} denied and {allowed} allowed tool requests.")
+    if bundle.get("wave6"):
+        denied, allowed = validate_wave6(args.directory, bundle, example)
+        blocked = validate_admission(bundle, example)
+        print(f"Wave 6: {denied} denied and {allowed} allowed MCP requests, "
+              f"{blocked} Kyverno admission rejections and one admission accepted.")
 
 
 if __name__ == "__main__":

@@ -215,6 +215,9 @@ func writeBundleFiles(dir, previous string, b compiler.Bundle) error {
 		"bundle.json": b,
 		"iam.tf.json": b.Terraform,
 	}
+	if b.Wave6 {
+		artifacts["wave6-policy-data.json"] = map[string]any{"aegismesh_wave6": b}
+	}
 	if len(b.ToolAuthorizations) != 0 {
 		artifacts["tool-authorization-data.json"] = map[string]any{"aegismesh_tool_authorizations": b.ToolAuthorizations}
 	}

@@ -1,6 +1,6 @@
 # AegisMesh
 
-AegisMesh compiles a multi-tenant workload intent into Cilium, Istio, Kubernetes Gateway API, SPIRE, Tetragon and AWS IAM policies. Its Go prover checks shortest capability paths for denied reachability, metadata SSRF and the Lethal Trifecta before emitting artifacts.
+AegisMesh compiles a multi-tenant workload intent into Cilium, Istio, Kubernetes Gateway API, SPIRE, Tetragon, Kyverno, AWS IAM, and GCP IAM and VPC Service Controls policies. Its Go prover checks shortest capability paths for denied reachability, metadata SSRF and the Lethal Trifecta before emitting artifacts.
 
 ## Try it
 
@@ -23,8 +23,9 @@ Compilation requires a new output directory. Configure workloads with the declar
 | `iam.tf.json`, `iam-*.json` | Terraform/OpenTofu JSON configuration and exact IAM trust and access documents. Use the existing Terraform state or import roles and inline policies before planning a migration. |
 | `iam.tf.json.diff` | Optional offline diff from `-previous-tf`. Sample changes replace an S3 wildcard grant with scoped object and secret reads. |
 | `bundle.json`, `gate.rego` | Machine-readable compilation and OPA gate. |
-| `tetragon.yaml` | Namespaced executable allowlists for workloads that declare runtime policy. |
+| `tetragon.yaml` | Namespaced executable allowlists and the MCP agent socket guard. |
 | `tool-authorization-data.json` | OPA data for scoped agent-to-tool edges, emitted when the intent authorizes tool calls. |
+| `wave6-policy-data.json` | Reviewed Wave 6 compilation for the artifact gate and MCP runtime authorization. |
 
 The example expects CoreDNS labeled `k8s-app=kube-dns` in `kube-system` and uses regional AWS endpoints. An Istio installation must provision the matching trust domain, sidecar enrollment, SPIRE attestation and workload identity socket, and any required mesh control-plane connectivity. See the RFC for policy ownership and infrastructure assumptions.
 
@@ -66,6 +67,26 @@ go run ./cmd/aegismesh drift -intent examples/wave4.json -cluster west -live wes
 
 Open `policy-diff/index.html` for the side-by-side view or read `policy-diff/policy-diff.json` for the changed sections and their previous and current values. Include managed Tetragon policies in the live export when checking runtime drift.
 
+## Wave 6 cloud, admission and MCP policy
+
+[The Wave 6 example](examples/wave6.json) combines AWS IAM, GCP IAM and VPC Service Controls, hardened pod admission, and an MCP gateway.
+
+- **GCP.** Declare the project ID and number, GKE workload bindings, and enforced service perimeters. Bindings grant the predefined Storage Object Viewer or Artifact Registry Reader role to exact Kubernetes service-account subjects in the target project's GKE workload identity pool. The perimeter must cover that project and restrict the service corresponding to the role. GCP project aliases can be used as `neverReach` targets. Provision the GKE workload identity pool and Access Context Manager access policy beforehand. Terraform bindings manage the full member set for each project and role, so reconcile existing members and import existing bindings and perimeters before applying. Restrict which clusters, namespaces and users can mint the declared Kubernetes identities.
+- **Admission.** Set `admission.registryPrefixes` on each protected workload. The Kyverno ValidatingPolicy rejects pods with mismatched workload labels and service accounts, host namespaces, hostPath volumes, root users, writable root filesystems, privilege escalation, or images outside the listed prefixes. Prefixes end with a slash so similarly named registries or repositories cannot match. The policy also checks init and ephemeral containers, including the ephemeral-container update subresource. Use Kyverno 1.16 and configure any injected sidecars and init containers to meet the same policy.
+- **MCP.** Declare an untrusted agent, a dedicated trusted gateway in the same tenant and trust domain, an exact upstream FQDN resource, and exact method/path grants. GET and HEAD can be read-only. Approval-gated grants require a verified approval even for GET or HEAD. The gateway alone gets Cilium DNS L7 and TCP 443 egress to the upstream. The agent can reach the gateway on TCP 8080 through the Istio profile, which enforces the caller principal and declared methods and paths. Tetragon constrains executables and blocks direct agent TCP connections to port 443 using the `security_socket_connect` kprobe. This guard requires a kernel that supports Tetragon's kprobe override in addition to the BPF LSM setting used for executable enforcement.
+
+Provision the gateway implementation and its Service on port 8080. The gateway verifies mTLS, validates the host and exact request path, and queries `data.aegismesh.allow_mcp` with `peer_spiffe_id`, `gateway_spiffe_id`, `upstream`, `method`, and `path`. The gateway keeps forwarding to the configured HTTPS origin, verifies the server certificate, rejects redirects, and rejects ambiguous encodings and query strings. Use read-only methods only for operations the upstream actually treats as read-only. For gated calls, the trusted approval verifier must bind a short-lived, single-use approval to the request ID, SHA-256 digest of the exact forwarded request, principal, gateway, upstream, method and path. Pass `request_id`, `request_digest` and the corresponding `verified_approval` object to OPA, then consume the approval before forwarding. The OPA inputs must come from the gateway and approval verifier. This integration enforces HTTP and approval semantics above the encrypted transport.
+
+Load `wave6-policy-data.json` from a trusted compilation when gating the bundle. The gate also checks the GCP binding and perimeter constraints. Deploy the Cilium-only profile for workloads that do not need MCP access. That profile leaves MCP agent-to-gateway connections closed.
+
+```sh
+go run ./cmd/aegismesh compile -intent examples/wave6.json \
+  -previous-tf examples/legacy-iam.tf.json -out ./compiled-wave6
+opa eval --fail -d compiled-wave6/gate.rego -d compiled-wave6/wave6-policy-data.json \
+  -i compiled-wave6/bundle.json 'data.aegismesh.allow == true'
+python tests/validate_artifacts.py ./compiled-wave6 --example wave6.json
+```
+
 ## Verification
 
 ```sh
@@ -73,14 +94,14 @@ go test -race -v ./...
 go run ./benchmarks/run_bench.go
 ```
 
-CI compiles three examples, checks manifests against pinned upstream CRD schemas, exercises the Rego gate, live drift and the offline revision viewer, validates Terraform and runs the benchmarks. See the [RFC](rfcs/001-policy-compiler-and-prover.md) and [measured results](benchmarks/RESULTS.md).
+CI compiles the checked-in examples, validates manifests against pinned CRD schemas, and runs Kyverno admission and OPA policy checks, drift and revision comparisons, Terraform validation, and benchmarks. See the [RFC](rfcs/001-policy-compiler-and-prover.md) and [measured results](benchmarks/RESULTS.md).
 
-The Go race suite caught 82 of 82 non-compliant intent mutations with witness traces (100%) and accepted 27 of 27 production-style topology fixtures (0 false rejections). Python checked 79 Kubernetes manifests across three examples, including two Tetragon policies, and verified six changed sections in the HTML and JSON revision reports. The artifact checks observed 44 Rego rejections with witnesses and 26 denied and four allowed OPA tool requests.
+The Go race suite rejected 115 of 115 non-compliant intent mutations with witnesses and accepted 32 of 32 valid topology fixtures, with zero false rejections. Artifact validation checked 100 Kubernetes manifests across four examples. OPA rejected 66 artifact mutations with witnesses, denied 20 MCP requests and allowed two. The Kyverno CLI denied 15 non-compliant pods and accepted the compliant pod.
 
 Measured on Go 1.24.13, linux/amd64, with `GOMAXPROCS=3` and 50 timed runs per operation. Compile includes proof. Allocations are mean Go heap MiB per run.
 
 | Workload nodes | Proof p95 (ms) | Compile p95 (ms) | Proof allocated (MiB/run) | Compile allocated (MiB/run) |
 | ---: | ---: | ---: | ---: | ---: |
-| 50 | 0.294643 | 1.295400 | 0.068609 | 1.059845 |
-| 250 | 6.204288 | 7.247498 | 0.690912 | 5.704768 |
-| 1000 | 12.102581 | 39.874526 | 5.680665 | 25.665724 |
+| 50 | 0.327372 | 2.003203 | 0.080170 | 1.124876 |
+| 250 | 1.623346 | 7.097447 | 0.740547 | 5.887447 |
+| 1000 | 10.829638 | 38.236583 | 5.891579 | 26.299110 |

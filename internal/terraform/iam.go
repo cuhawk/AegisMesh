@@ -1,4 +1,4 @@
-// Package terraform renders exact AWS IAM grants as Terraform JSON configuration.
+// Package terraform renders cloud IAM and perimeter grants as Terraform JSON configuration.
 package terraform
 
 import (
@@ -98,5 +98,6 @@ func Render(in intent.Intent) (Object, map[string]Policy, error) {
 	if account != "" {
 		config["provider"] = Object{"aws": Object{"allowed_account_ids": []string{account}}}
 	}
+	addGCP(config, in)
 	return config, policies, nil
 }

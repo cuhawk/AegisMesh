@@ -19,6 +19,8 @@ import (
 type object = map[string]any
 
 type Bundle struct {
+	Wave6              bool                         `json:"wave6,omitempty"`
+	MCPAuthorizations  []MCPAuthorization           `json:"mcpAuthorizations,omitempty"`
 	Clusters           map[string]*ClusterArtifacts `json:"clusters,omitempty"`
 	Tetragon           []object                     `json:"tetragon,omitempty"`
 	CiliumHTTP         []object                     `json:"ciliumHTTP"`
@@ -61,6 +63,7 @@ func Compile(in intent.Intent) (Bundle, error) {
 	if err := prover.RequireSafe(in); err != nil {
 		return Bundle{}, err
 	}
+	in = in.WithMCPRules()
 	in.Workloads = slices.Clone(in.Workloads)
 	in.Rules = slices.Clone(in.Rules)
 	slices.SortFunc(in.Workloads, func(a, b intent.Workload) int { return strings.Compare(a.ID, b.ID) })
@@ -73,7 +76,7 @@ func Compile(in intent.Intent) (Bundle, error) {
 	if err != nil {
 		return Bundle{}, err
 	}
-	b := Bundle{Terraform: tf, IAM: iam, Clusters: federationBindings(in)}
+	b := Bundle{Terraform: tf, IAM: iam, Clusters: federationBindings(in), Wave6: in.GCP != nil || len(in.MCP) != 0}
 	addKubernetes := func(cluster string, o object) {
 		b.Kubernetes = append(b.Kubernetes, o)
 		if target := b.Clusters[cluster]; target != nil {
@@ -111,6 +114,11 @@ func Compile(in intent.Intent) (Bundle, error) {
 	for _, r := range in.Resources {
 		resources[r.ID] = r
 	}
+	b.MCPAuthorizations = mcpAuthorizations(in, workloads, resources)
+	mcpAgents, mcpGateways := make(map[string]bool), make(map[string]bool)
+	for _, m := range in.MCP {
+		mcpAgents[m.Agent], mcpGateways[m.Gateway] = true, true
+	}
 	ingress := make(map[string][]object)
 	httpIngress := make(map[string][]object)
 	httpEgress := make(map[string][]object)
@@ -130,7 +138,7 @@ func Compile(in intent.Intent) (Bundle, error) {
 			toEntry := object{"toEndpoints": []object{endpoint(to, true, toCluster)}, "toPorts": port(r.Port, "TCP", nil)}
 			ingress[r.To] = append(ingress[r.To], object{"fromEndpoints": fromEndpoints, "toPorts": port(r.Port, "TCP", nil)})
 			egress[r.From] = append(egress[r.From], toEntry)
-			if fromCluster == toCluster && to.ToolScope == "" {
+			if fromCluster == toCluster && to.ToolScope == "" && !mcpGateways[r.To] {
 				http := object{"http": []object{{"method": "^" + r.Method + "$", "path": "^" + regexp.QuoteMeta(r.Path) + "$"}}}
 				httpIngress[r.To] = append(httpIngress[r.To], object{"fromEndpoints": fromEndpoints, "toPorts": port(r.Port, "TCP", http)})
 				if in.Federation != nil {
@@ -179,7 +187,7 @@ func Compile(in intent.Intent) (Bundle, error) {
 		addKubernetes(cluster, manifest(cilium, "CiliumNetworkPolicy", w.ID, w.Namespace, spec))
 		httpSpec := maps.Clone(spec)
 		httpSpec["ingress"] = append([]object{{"fromEntities": []string{"none"}}}, httpIngress[w.ID]...)
-		if in.Federation != nil {
+		if in.Federation != nil || mcpAgents[w.ID] {
 			httpSpec["egress"] = append([]object{{"toEntities": []string{"none"}}}, httpEgress[w.ID]...)
 		}
 		addCiliumHTTP(cluster, manifest(cilium, "CiliumNetworkPolicy", w.ID, w.Namespace, httpSpec))
@@ -222,8 +230,17 @@ func Compile(in intent.Intent) (Bundle, error) {
 			target.SPIRE = append(target.SPIRE, entry)
 		}
 		b.SPIRE = append(b.SPIRE, entry)
+		if w.Admission != nil {
+			b.Wave6 = true
+			policy := admissionPolicy(w)
+			addKubernetes(cluster, policy)
+			addCiliumHTTP(cluster, policy)
+		}
 		if len(w.ExecAllowlist) != 0 {
 			policy := executionPolicy(w)
+			if mcpAgents[w.ID] {
+				policy["spec"].(object)["kprobes"] = mcpSocketGuard()
+			}
 			b.Tetragon = append(b.Tetragon, policy)
 			if target := b.Clusters[cluster]; target != nil {
 				target.Tetragon = append(target.Tetragon, policy)

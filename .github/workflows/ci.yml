@@ -46,4 +46,14 @@ jobs:
           for cluster in east west; do
             go run ./cmd/aegismesh drift -intent examples/wave4.json -cluster "$cluster" -live "${RUNNER_TEMP}/aegismesh-wave4/clusters/$cluster/verified-live.json"
           done
+      - name: Compile and validate Wave 6 cloud, admission and MCP policies
+        run: |
+          curl -fsSL https://github.com/kyverno/kyverno/releases/download/v1.16.0/kyverno-cli_v1.16.0_linux_x86_64.tar.gz | tar xz -C "${RUNNER_TEMP}" kyverno
+          export PATH="${RUNNER_TEMP}:$PATH"
+          wave6="${RUNNER_TEMP}/aegismesh-wave6"
+          go run ./cmd/aegismesh compile -intent examples/wave6.json -previous-tf examples/legacy-iam.tf.json -out "$wave6"
+          python tests/validate_artifacts.py "$wave6" --example wave6.json
+          go run ./cmd/aegismesh drift -intent examples/wave6.json -live "$wave6/verified-live.json"
+          terraform -chdir="$wave6" init -backend=false -input=false
+          terraform -chdir="$wave6" validate
       - run: go run ./benchmarks/run_bench.go

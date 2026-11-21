@@ -8,6 +8,8 @@ import (
 )
 
 type Intent struct {
+	GCP             *GCP                `json:"gcp,omitempty"`
+	MCP             []MCP               `json:"mcp,omitempty"`
 	Federation      *Federation         `json:"federation,omitempty"`
 	SPIREParent     string              `json:"spireParent"`
 	TrustDomain     string              `json:"trustDomain"`
@@ -22,6 +24,7 @@ type Intent struct {
 }
 
 type Workload struct {
+	Admission      *Admission   `json:"admission,omitempty"`
 	TrustDomain    string       `json:"trustDomain,omitempty"`
 	ExecAllowlist  []string     `json:"execAllowlist,omitempty"`
 	ID             string       `json:"id"`
