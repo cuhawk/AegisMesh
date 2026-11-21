@@ -215,8 +215,7 @@ deny contains "invalid Terraform inline policies" if {
 
 deny contains msg if {
 	some kind, _ in input.terraform.resource
-	kind != "aws_iam_role"
-	kind != "aws_iam_role_policy"
+	not kind in reviewed_terraform_kinds
 	msg := sprintf("unreviewed Terraform resource: %s", [kind])
 }
 
@@ -398,4 +397,135 @@ scoped_route(spec) if {
 	backend.port <= 65535
 	object.get(rule, "filters", []) == []
 	object.get(backend, "filters", []) == []
+}
+
+# The Wave 6 data file is the reviewed compilation. Compare all profiles so
+# adding an alternate path around any of the generated policies also fails.
+deny contains "Wave 6 policy data is required" if {
+	wave6_artifacts
+	not wave6_policy_data_present
+}
+
+wave6_policy_data_present if is_object(data.aegismesh_wave6)
+
+wave6_artifacts if input.wave6 == true
+
+wave6_artifacts if {
+	some policy in policies
+	policy.kind == "ValidatingPolicy"
+}
+
+wave6_artifacts if count(input.mcpAuthorizations) > 0
+
+wave6_artifacts if {
+	some kind, _ in input.terraform.resource
+	startswith(kind, "google_")
+}
+
+deny contains msg if {
+	is_object(data.aegismesh_wave6)
+	some field in (object.keys(data.aegismesh_wave6) | object.keys(input))
+	object.filter(data.aegismesh_wave6, [field]) != object.filter(input, [field])
+	msg := sprintf("Wave 6 artifact drift: %s", [field])
+}
+
+reviewed_terraform_kinds := {
+	"aws_iam_role", "aws_iam_role_policy", "google_project_iam_binding",
+	"google_access_context_manager_service_perimeter",
+}
+
+# The gateway authenticates both identities, checks canonical request routing
+# and supplies verified, single-use approvals bound to this exact request.
+default allow_mcp := false
+
+mcp_edges contains edge if {
+	some edge in data.aegismesh_wave6.mcpAuthorizations
+	input.peer_spiffe_id == edge.principal
+	input.gateway_spiffe_id == edge.gateway
+	input.upstream == edge.upstream
+	input.method == edge.method
+	input.path == edge.path
+}
+
+allow_mcp if {
+	some edge in mcp_edges
+	edge.mode == "read-only"
+	edge.method in {"GET", "HEAD"}
+}
+
+allow_mcp if {
+	some edge in mcp_edges
+	edge.mode == "approval-gated"
+	is_string(input.request_id)
+	input.request_id != ""
+	regex.match("^[a-f0-9]{64}$", input.request_digest)
+	input.verified_approval == {
+		"request_id": input.request_id,
+		"request_digest": input.request_digest,
+		"principal": edge.principal,
+		"gateway": edge.gateway,
+		"upstream": edge.upstream,
+		"method": edge.method,
+		"path": edge.path,
+	}
+}
+
+gcp_role_services := {
+	"roles/storage.objectViewer": "storage.googleapis.com",
+	"roles/artifactregistry.reader": "artifactregistry.googleapis.com",
+}
+
+deny contains msg if {
+	some name, binding in input.terraform.resource.google_project_iam_binding
+	not scoped_gcp_binding(binding)
+	msg := sprintf("unscoped GCP IAM binding: %s", [name])
+}
+
+scoped_gcp_binding(binding) if {
+	object.keys(binding) == {"project", "role", "members"}
+	regex.match("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", binding.project)
+	service := gcp_role_services[binding.role]
+	is_array(binding.members)
+	count(binding.members) > 0
+	every member in binding.members {
+		gcp_member_protected(member, binding.project, service)
+	}
+}
+
+gcp_member_protected(member, project, service) if {
+	pattern := concat("", [
+		"^principal://iam[.]googleapis[.]com/projects/([1-9][0-9]{0,19})/locations/global/workloadIdentityPools/",
+		project, "[.]svc[.]id[.]goog/subject/ns/[a-z0-9-]+/sa/[a-z0-9-]+$",
+	])
+	[[_, number]] := regex.find_all_string_submatch_n(pattern, member, 1)
+	some name, perimeter in input.terraform.resource.google_access_context_manager_service_perimeter
+	scoped_gcp_perimeter(name, perimeter)
+	sprintf("projects/%s", [number]) in perimeter.status.resources
+	service in perimeter.status.restricted_services
+}
+
+deny contains msg if {
+	some name, perimeter in input.terraform.resource.google_access_context_manager_service_perimeter
+	not scoped_gcp_perimeter(name, perimeter)
+	msg := sprintf("unscoped GCP service perimeter: %s", [name])
+}
+
+scoped_gcp_perimeter(name, perimeter) if {
+	object.keys(perimeter) == {"parent", "name", "title", "perimeter_type", "status"}
+	regex.match("^[a-z][a-z0-9_]{0,49}$", name)
+	regex.match("^accessPolicies/[1-9][0-9]{0,19}$", perimeter.parent)
+	perimeter.name == sprintf("%s/servicePerimeters/%s", [perimeter.parent, name])
+	perimeter.title == name
+	perimeter.perimeter_type == "PERIMETER_TYPE_REGULAR"
+	object.keys(perimeter.status) == {"resources", "restricted_services"}
+	is_array(perimeter.status.resources)
+	count(perimeter.status.resources) > 0
+	every resource in perimeter.status.resources {
+		regex.match("^projects/[1-9][0-9]{0,19}$", resource)
+	}
+	is_array(perimeter.status.restricted_services)
+	count(perimeter.status.restricted_services) > 0
+	every service in perimeter.status.restricted_services {
+		service in gcp_role_services
+	}
 }

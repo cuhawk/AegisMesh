@@ -25,7 +25,7 @@ func key(o object) (string, error) {
 	m, _ := o["metadata"].(object)
 	name, c := m["name"].(string)
 	namespace, _ := m["namespace"].(string)
-	if namespace == "" && kind != "CiliumClusterwideNetworkPolicy" && kind != "TracingPolicy" {
+	if namespace == "" && kind != "CiliumClusterwideNetworkPolicy" && kind != "TracingPolicy" && kind != "ValidatingPolicy" {
 		namespace = "default"
 	}
 	if !a || !b || !c || api == "" || kind == "" || name == "" {
@@ -64,7 +64,7 @@ func managedFields(o object) ([]byte, error) {
 
 func relevant(o object) bool {
 	switch o["kind"] {
-	case "NetworkPolicy", "CiliumNetworkPolicy", "CiliumClusterwideNetworkPolicy", "AuthorizationPolicy", "PeerAuthentication", "RequestAuthentication", "HTTPRoute", "ReferenceGrant", "TracingPolicy", "TracingPolicyNamespaced":
+	case "NetworkPolicy", "CiliumNetworkPolicy", "CiliumClusterwideNetworkPolicy", "AuthorizationPolicy", "PeerAuthentication", "RequestAuthentication", "HTTPRoute", "ReferenceGrant", "TracingPolicy", "TracingPolicyNamespaced", "ValidatingPolicy":
 		return true
 	case "ServiceAccount":
 		m, _ := o["metadata"].(object)

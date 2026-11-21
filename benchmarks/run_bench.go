@@ -58,19 +58,29 @@ func topology(n int) intent.Intent {
 		{Pair: intent.Pair{From: "agent", To: "tool"}, Kind: "http", Port: 8080, Method: "POST", Path: "/lookup", ToolScope: "lookup"},
 	}
 	in.NeverReach = []intent.Pair{{From: "agent", To: "metadata"}, {From: "gateway", To: "tool"}}
+	admission := &intent.Admission{RegistryPrefixes: []string{"registry.example.com/mesh/"}}
+	in.Workloads = append(in.Workloads,
+		intent.Workload{ID: "mcp-agent", Namespace: "benchmark", ServiceAccount: "mcp-agent", Tenant: "benchmark", SVIDTTL: 900, Untrusted: true, Admission: admission},
+		intent.Workload{ID: "mcp-gateway", Namespace: "benchmark", ServiceAccount: "mcp-gateway", Tenant: "benchmark", SVIDTTL: 900, Admission: admission},
+	)
+	in.Resources = append(in.Resources, intent.Resource{ID: "mcp-upstream", Kind: "fqdn", Value: "mcp.example.com"})
+	in.MCP = []intent.MCP{{Agent: "mcp-agent", Gateway: "mcp-gateway", Upstream: "mcp-upstream",
+		Paths: []intent.MCPPath{
+			{Method: "GET", Path: "/lookup", Mode: intent.MCPReadOnly},
+			{Method: "POST", Path: "/publish", Mode: intent.MCPApprovalGated},
+		},
+	}}
+	in.GCP = &intent.GCP{
+		Projects: map[string]intent.GCPProject{"cloud-data": {ID: "mesh-data-prod", Number: "123456789012"}},
+		Bindings: []intent.GCPBinding{{Workload: "catalog", Project: "cloud-data", Role: "roles/storage.objectViewer"}},
+		Perimeters: map[string]intent.GCPPerimeter{"mesh_perimeter": {
+			AccessPolicy: "123456789", Projects: []string{"cloud-data"}, Services: []string{"storage.googleapis.com"},
+		}},
+	}
 	ringSize := n - len(in.Workloads)
 	for i := range ringSize {
 		id := fmt.Sprintf("service-%04d", i)
 		next := fmt.Sprintf("service-%04d", (i+1)%ringSize)
-		in.Federation = &intent.Federation{
-			TrustDomains: map[string]intent.TrustDomain{
-				in.TrustDomain: {Cluster: "east", SPIREParent: in.SPIREParent,
-					BundleEndpoint: "https://bundle.east.example.org", Trusts: []string{"west.example.org"}},
-				"west.example.org": {Cluster: "west", SPIREParent: "spiffe://west.example.org/spire/agent/benchmark",
-					BundleEndpoint: "https://bundle.west.example.org", Trusts: []string{in.TrustDomain}},
-			},
-			AllowReach: []intent.Pair{{From: "agent", To: "tool"}},
-		}
 		in.Workloads = append(in.Workloads, intent.Workload{
 			ID: id, Namespace: "benchmark", ServiceAccount: id, Tenant: "benchmark",
 			SVIDTTL: 900, Ingress: i%50 == 0, Untrusted: i%100 == 0,
@@ -111,7 +121,7 @@ func main() {
 	fmt.Println("# Benchmark results")
 	fmt.Println()
 	fmt.Printf("%s, %s/%s, GOMAXPROCS=%d. %d timed runs per row after three warm-ups.\n", runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.GOMAXPROCS(0), runs)
-	fmt.Println("Each topology includes a cross-namespace Gateway route, a federated JWT-SVID tool edge, a sparse service ring and an executable allowlist per workload.")
+	fmt.Println("Each topology includes a cross-namespace Gateway route, a federated JWT-SVID tool edge, a sparse service ring, executable allowlists, a GCP IAM binding and perimeter, and an MCP gateway with hardened pod admission.")
 	fmt.Println("Compile includes proof and in-memory rendering. Allocation is mean Go heap allocation per run.")
 	fmt.Println()
 	fmt.Println("| Workload nodes | Operation | p50 (ms) | p95 (ms) | p99 (ms) | Allocated (MiB/run) |")

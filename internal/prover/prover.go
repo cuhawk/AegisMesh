@@ -110,6 +110,7 @@ func Check(in intent.Intent) []Finding {
 			add("invalid or duplicate workload", w.ID)
 		}
 		checkWorkloadPolicy(in, w, add)
+		checkAdmission(w, add)
 		identity := w.Principal(in.TrustDomain)
 		if old, exists := identities[identity]; exists {
 			add("shared workload identity", old, w.ID)
@@ -148,6 +149,18 @@ func Check(in intent.Intent) []Finding {
 		}
 		targets[key] = resource.ID
 		kinds[resource.ID], resources[resource.ID] = resource.Kind, resource
+	}
+	preWave6 := len(findings)
+	checkGCP(in, kinds, workloads, add)
+	checkMCP(in, workloads, resources, add)
+	if len(findings) != preWave6 {
+		return findings
+	}
+	in = in.WithMCPRules()
+	if in.GCP != nil {
+		for name := range in.GCP.Projects {
+			kinds[name] = "gcp-project"
+		}
 	}
 	type match struct {
 		intent.Pair
@@ -219,6 +232,11 @@ func Check(in intent.Intent) []Finding {
 		assumedRoles[r.From], trustedRoles[r.To] = r.To, true
 	}
 	graph := make(map[string][]string)
+	if in.GCP != nil {
+		for _, binding := range in.GCP.Bindings {
+			graph[binding.Workload] = append(graph[binding.Workload], binding.Project)
+		}
+	}
 	toolCalls := make(map[string][]intent.Rule)
 	allowedToolCalls := make(map[match]bool)
 	predecessors := make(map[string][]string)
@@ -308,7 +326,7 @@ func Check(in intent.Intent) []Finding {
 					}
 				}
 			}
-			if vault == "" && (kind == "vault" || kind == "object") {
+			if vault == "" && (kind == "vault" || kind == "object" || kind == "gcp-project") {
 				vault = current
 			}
 			if (w.Ingress || w.Untrusted) && (kind == "metadata" || containsMetadata(resources[current])) {
